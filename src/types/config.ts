@@ -48,8 +48,10 @@ export interface ProjectConfig {
   createdAt: string;
   /** ISO timestamp when project was last accessed */
   lastAccessed: string;
-  /** Custom values collected during bundle onboarding */
+  /** Custom values collected during bundle onboarding (from input steps) */
   bundleValues?: Record<string, string>;
+  /** Keys of secrets stored in OS keychain via Bun.secrets (from secret steps) */
+  bundleSecretKeys?: string[];
   /** Information about the bundle that was applied */
   appliedBundle?: AppliedBundle;
 }

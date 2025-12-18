@@ -5,8 +5,9 @@
 import { spawn, spawnSync } from 'child_process'
 import { logger } from '../utils/logger.js'
 import { hasSetupBeenRun, markSetupComplete } from '../utils/workspace-state.js'
-import { runScriptsInTerminal } from '../utils/run-scripts.js'
-import { getScriptsPhaseDir } from './config.js'
+import { runScriptsInTerminal, type RunScriptsOptions } from '../utils/run-scripts.js'
+import { getScriptsPhaseDir, readProjectConfig } from './config.js'
+import { getProjectSecrets } from '../utils/secrets.js'
 
 /**
  * Print a message to terminal using echo (same mechanism as scripts)
@@ -35,6 +36,17 @@ export async function openWorkspaceShell(
 ): Promise<void> {
 	const workspaceName = workspacePath.split('/').pop() || 'workspace'
 
+	// Build script options with bundle values and secrets
+	const projectConfig = readProjectConfig(projectName)
+	const scriptOptions: RunScriptsOptions = {
+		bundleValues: projectConfig.bundleValues,
+	}
+
+	// Fetch secrets from OS keychain if we have secret keys
+	if (projectConfig.bundleSecretKeys && projectConfig.bundleSecretKeys.length > 0) {
+		scriptOptions.bundleSecrets = await getProjectSecrets(projectName, projectConfig.bundleSecretKeys)
+	}
+
 	if (selectOnly) {
 		// TUI mode: setup was done during creation, just run select scripts
 		const selectScriptsDir = getScriptsPhaseDir(projectName, 'select')
@@ -42,7 +54,8 @@ export async function openWorkspaceShell(
 			selectScriptsDir,
 			workspacePath,
 			workspaceName,
-			repository
+			repository,
+			scriptOptions
 		)
 	} else {
 		const setupAlreadyRun = hasSetupBeenRun(workspacePath)
@@ -55,7 +68,8 @@ export async function openWorkspaceShell(
 				selectScriptsDir,
 				workspacePath,
 				workspaceName,
-				repository
+				repository,
+				scriptOptions
 			)
 		} else if (!noSetup) {
 			// First time setup, run setup scripts
@@ -65,7 +79,8 @@ export async function openWorkspaceShell(
 				setupScriptsDir,
 				workspacePath,
 				workspaceName,
-				repository
+				repository,
+				scriptOptions
 			)
 
 			// Mark setup as complete

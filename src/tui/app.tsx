@@ -24,7 +24,7 @@ import {
   getAllProjectNames,
 } from '../core/config.js';
 import { openWorkspaceShell } from '../core/shell.js';
-import { removeWorkspace } from '../commands/remove.js';
+import { removeWorkspace, removeProject } from '../commands/remove.js';
 import { listAllRepos, cloneRepository } from '../core/github.js';
 import { listRemoteBranches, getDefaultBranch, createWorktree, checkRemoteBranch } from '../core/git.js';
 import { fetchUnstartedIssues } from '../core/linear.js';
@@ -32,17 +32,25 @@ import { sanitizeForFileSystem, extractRepoName, generateWorkspaceName, isValidW
 import { join } from 'path';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { generateMarkdown } from '../utils/markdown.js';
-import { runScriptsInTerminal } from '../utils/run-scripts.js';
+import { runScriptsInTerminal, type RunScriptsOptions } from '../utils/run-scripts.js';
+import { getProjectSecrets } from '../utils/secrets.js';
 import { getScriptsPhaseDir, updateProjectConfig } from '../core/config.js';
 import { markSetupComplete } from '../utils/workspace-state.js';
 import { createRequire } from 'module';
+import { appendFileSync } from 'fs';
+import { homedir } from 'os';
 import {
   detectBundleInRepo,
   loadBundleFromPath,
   copyBundleScripts,
 } from '../core/bundle.js';
-import { runOnboarding } from '../utils/onboarding.js';
-import { promptConfirm } from '../utils/prompts.js';
+import { setProjectSecret } from '../utils/secrets.js';
+// Debug log to file (useful for debugging TUI issues)
+const DEBUG_LOG = join(homedir(), 'spaces-debug.log');
+function debugLog(msg: string) {
+  const timestamp = new Date().toISOString();
+  appendFileSync(DEBUG_LOG, `[${timestamp}] ${msg}\n`);
+}
 
 // Version from package.json
 const require = createRequire(import.meta.url);
@@ -75,13 +83,28 @@ const COLORS = {
 type FlowState =
   | { type: 'none' }
   | { type: 'help' }
-  | { type: 'confirm-delete'; target: { type: 'workspace'; name: string } }
+  | { type: 'confirm-delete'; target: { type: 'workspace'; name: string } | { type: 'project'; name: string } }
   | { type: 'workspace-actions'; projectName: string; workspaceName: string }
   // New Project flow
   | { type: 'new-project-loading' }
   | { type: 'new-project-select'; repos: string[]; selectedIndex: number }
   | { type: 'new-project-cloning'; repo: string }
-  | { type: 'new-project-onboarding'; repo: string; projectName: string; baseBranch: string }
+  | {
+      type: 'new-project-onboarding';
+      repo: string;
+      projectName: string;
+      baseBranch: string;
+      bundleDir: string;
+      bundleName: string;
+      steps: import('../types/bundle.js').OnboardingStep[];
+      currentStep: number;
+      collectedValues: Record<string, string>;
+      /** Keys of secrets that have been stored via Bun.secrets */
+      collectedSecretKeys: string[];
+      inputValue: string;
+      /** For confirm steps: status of command check */
+      confirmStatus?: 'checking' | 'found' | 'missing' | null;
+    }
   // New Workspace flow
   | { type: 'new-workspace-source'; selectedIndex: number; hasLinear: boolean }
   | { type: 'new-workspace-loading'; source: 'branch' | 'linear' }
@@ -364,76 +387,84 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
     try {
       const baseDir = getProjectBaseDir(projectName);
+      debugLog(`Cloning ${repo} to ${baseDir}`);
       await cloneRepository(repo, baseDir);
+      debugLog(`Clone complete`);
+
       const baseBranch = await getDefaultBranch(baseDir);
+      debugLog(`Default branch: ${baseBranch}`);
 
       // Check for bundle in cloned repo
+      debugLog(`Checking for bundle in: ${baseDir}`);
       const bundleDir = detectBundleInRepo(baseDir);
+      debugLog(`bundleDir result: ${bundleDir}`);
+
       if (bundleDir) {
+        debugLog(`Bundle directory found, loading...`);
         try {
           const loadedBundle = loadBundleFromPath(bundleDir);
+          debugLog(`Bundle loaded: ${loadedBundle.bundle.name}`);
+          debugLog(`Onboarding steps: ${loadedBundle.bundle.onboarding?.length ?? 0}`);
 
-          // If bundle has onboarding steps, run them
+          // If bundle has onboarding steps, start the TUI onboarding flow
           if (loadedBundle.bundle.onboarding && loadedBundle.bundle.onboarding.length > 0) {
-            // Show onboarding state briefly then suspend for CLI prompts
-            setFlow({ type: 'new-project-onboarding', repo, projectName, baseBranch });
+            debugLog(`Has onboarding steps, starting TUI onboarding flow...`);
+            const firstStep = loadedBundle.bundle.onboarding[0];
+            const initialInputValue = firstStep.type === 'input' && firstStep.defaultValue ? firstStep.defaultValue : '';
 
-            // Suspend renderer and run CLI-based onboarding
-            renderer.suspend();
-            console.log(`\n📦 Bundle detected: ${loadedBundle.bundle.name}\n`);
+            // Check if first step is a confirm step with checkCommand
+            if (firstStep.type === 'confirm' && firstStep.checkCommand) {
+              setFlow({
+                type: 'new-project-onboarding',
+                repo,
+                projectName,
+                baseBranch,
+                bundleDir: loadedBundle.bundleDir,
+                bundleName: loadedBundle.bundle.name,
+                steps: loadedBundle.bundle.onboarding,
+                currentStep: 0,
+                collectedValues: {},
+                collectedSecretKeys: [],
+                inputValue: '',
+                confirmStatus: 'checking',
+              });
 
-            const proceed = await promptConfirm(
-              `This repository has ${loadedBundle.bundle.onboarding.length} onboarding step(s). Run them now?`,
-              true
-            );
-
-            if (proceed) {
-              const onboardingResult = await runOnboarding(loadedBundle.bundle.onboarding);
-
-              // Create project first
-              createProject(projectName, repo, baseBranch);
-
-              // Copy bundle scripts
-              copyBundleScripts(loadedBundle.bundleDir, projectName);
-
-              // Store bundle values and info
-              const configUpdates: Record<string, unknown> = {};
-              if (onboardingResult.completed && Object.keys(onboardingResult.configValues).length > 0) {
-                configUpdates.bundleValues = onboardingResult.configValues;
-              }
-              configUpdates.appliedBundle = {
-                name: loadedBundle.bundle.name,
-                version: loadedBundle.bundle.version,
-                source: loadedBundle.source,
-                appliedAt: new Date().toISOString(),
-              };
-              updateProjectConfig(projectName, configUpdates);
-
-              if (!onboardingResult.completed) {
-                console.log('\n⚠️  Onboarding was not completed. You can re-run it later.\n');
-              }
+              // Check command asynchronously
+              const checkCmd = firstStep.checkCommand;
+              import('child_process').then(async ({ exec }) => {
+                const { promisify } = await import('util');
+                const execAsync = promisify(exec);
+                try {
+                  await execAsync(`which ${checkCmd}`);
+                  setFlow((prev) => {
+                    if (prev.type !== 'new-project-onboarding') return prev;
+                    return { ...prev, confirmStatus: 'found' };
+                  });
+                } catch {
+                  setFlow((prev) => {
+                    if (prev.type !== 'new-project-onboarding') return prev;
+                    return { ...prev, confirmStatus: 'missing' };
+                  });
+                }
+              });
             } else {
-              // User skipped onboarding, still create project and copy scripts
-              createProject(projectName, repo, baseBranch);
-              copyBundleScripts(loadedBundle.bundleDir, projectName);
-
-              // Store bundle info without values
-              updateProjectConfig(projectName, {
-                appliedBundle: {
-                  name: loadedBundle.bundle.name,
-                  version: loadedBundle.bundle.version,
-                  source: loadedBundle.source,
-                  appliedAt: new Date().toISOString(),
-                },
+              setFlow({
+                type: 'new-project-onboarding',
+                repo,
+                projectName,
+                baseBranch,
+                bundleDir: loadedBundle.bundleDir,
+                bundleName: loadedBundle.bundle.name,
+                steps: loadedBundle.bundle.onboarding,
+                currentStep: 0,
+                collectedValues: {},
+                collectedSecretKeys: [],
+                inputValue: initialInputValue,
+                confirmStatus: null,
               });
             }
-
-            console.log('\nPress Enter to continue...');
-            await new Promise<void>(resolve => {
-              process.stdin.once('data', () => resolve());
-            });
-
-            renderer.resume();
+            // Return here - the flow will be continued by keyboard handlers
+            return;
           } else {
             // Bundle exists but no onboarding steps, just copy scripts
             createProject(projectName, repo, baseBranch);
@@ -473,6 +504,119 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       setFlow({ type: 'none' });
     }
   }, [renderer]);
+
+  // Finalize project creation after onboarding
+  const finalizeProjectAfterOnboarding = useCallback(
+    async (
+      projectName: string,
+      repo: string,
+      baseBranch: string,
+      bundleDir: string,
+      bundleName: string,
+      collectedValues: Record<string, string>,
+      collectedSecretKeys: string[]
+    ) => {
+      try {
+        // Create the project
+        createProject(projectName, repo, baseBranch);
+
+        // Copy bundle scripts
+        const bundleResult = loadBundleFromPath(bundleDir);
+        copyBundleScripts(bundleDir, projectName);
+
+        // Store bundle values, secret keys, and metadata
+        updateProjectConfig(projectName, {
+          bundleValues: collectedValues,
+          bundleSecretKeys: collectedSecretKeys.length > 0 ? collectedSecretKeys : undefined,
+          appliedBundle: {
+            name: bundleName,
+            version: bundleResult.bundle.version,
+            source: bundleResult.source,
+            appliedAt: new Date().toISOString(),
+          },
+        });
+
+        setCurrentProject(projectName);
+
+        // Refresh projects
+        const projects = loadProjects();
+        dispatch({ type: 'SET_PROJECTS', projects });
+        const idx = projects.findIndex((p) => p.name === projectName);
+        if (idx >= 0) {
+          dispatch({ type: 'SELECT_PROJECT', index: idx });
+          dispatch({ type: 'SET_CURRENT_PROJECT', project: projectName });
+        }
+        setFlow({ type: 'none' });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to create project');
+        setFlow({ type: 'none' });
+      }
+    },
+    []
+  );
+
+  // Check command for confirm steps
+  const checkOnboardingCommand = useCallback(async (command: string): Promise<boolean> => {
+    try {
+      const { exec } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(exec);
+      await execAsync(`which ${command}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Advance to next onboarding step or finalize
+  const advanceOnboardingStep = useCallback(
+    async (flow: Extract<FlowState, { type: 'new-project-onboarding' }>) => {
+      const nextStep = flow.currentStep + 1;
+
+      if (nextStep >= flow.steps.length) {
+        // All steps done, finalize project
+        await finalizeProjectAfterOnboarding(
+          flow.projectName,
+          flow.repo,
+          flow.baseBranch,
+          flow.bundleDir,
+          flow.bundleName,
+          flow.collectedValues,
+          flow.collectedSecretKeys
+        );
+      } else {
+        // Move to next step
+        const nextStepData = flow.steps[nextStep];
+        let confirmStatus: 'checking' | 'found' | 'missing' | null = null;
+
+        // If next step is confirm with checkCommand, start checking
+        if (nextStepData.type === 'confirm' && nextStepData.checkCommand) {
+          confirmStatus = 'checking';
+          setFlow({
+            ...flow,
+            currentStep: nextStep,
+            inputValue: '',
+            confirmStatus,
+          });
+
+          // Check command asynchronously
+          const found = await checkOnboardingCommand(nextStepData.checkCommand);
+          setFlow((prev) => {
+            if (prev.type !== 'new-project-onboarding') return prev;
+            return { ...prev, confirmStatus: found ? 'found' : 'missing' };
+          });
+        } else {
+          setFlow({
+            ...flow,
+            currentStep: nextStep,
+            inputValue: nextStepData.type === 'input' && nextStepData.defaultValue ? nextStepData.defaultValue : '',
+            confirmStatus: null,
+          });
+        }
+      }
+    },
+    [finalizeProjectAfterOnboarding, checkOnboardingCommand]
+  );
 
   // Start new workspace flow
   const startNewWorkspaceFlow = useCallback(() => {
@@ -556,13 +700,21 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
       await createWorktree(baseDir, workspacePath, branch, config.baseBranch, true);
 
+      // Build script options with bundle values and secrets
+      const scriptOptions: RunScriptsOptions = {
+        bundleValues: config.bundleValues,
+      };
+      if (config.bundleSecretKeys && config.bundleSecretKeys.length > 0) {
+        scriptOptions.bundleSecrets = await getProjectSecrets(state.currentProject, config.bundleSecretKeys);
+      }
+
       // Run pre and setup scripts during creation
       const preScriptsDir = getScriptsPhaseDir(state.currentProject, 'pre');
       const setupScriptsDir = getScriptsPhaseDir(state.currentProject, 'setup');
       renderer.suspend();
       try {
-        await runScriptsInTerminal(preScriptsDir, workspacePath, workspaceName, config.repository);
-        await runScriptsInTerminal(setupScriptsDir, workspacePath, workspaceName, config.repository);
+        await runScriptsInTerminal(preScriptsDir, workspacePath, workspaceName, config.repository, scriptOptions);
+        await runScriptsInTerminal(setupScriptsDir, workspacePath, workspaceName, config.repository, scriptOptions);
         markSetupComplete(workspacePath);
       } finally {
         renderer.resume();
@@ -609,13 +761,21 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
         writeFileSync(join(promptDir, 'issue.md'), markdown, 'utf-8');
       }
 
+      // Build script options with bundle values and secrets
+      const scriptOptions: RunScriptsOptions = {
+        bundleValues: config.bundleValues,
+      };
+      if (config.bundleSecretKeys && config.bundleSecretKeys.length > 0) {
+        scriptOptions.bundleSecrets = await getProjectSecrets(state.currentProject, config.bundleSecretKeys);
+      }
+
       // Run pre and setup scripts during creation
       const preScriptsDir = getScriptsPhaseDir(state.currentProject, 'pre');
       const setupScriptsDir = getScriptsPhaseDir(state.currentProject, 'setup');
       renderer.suspend();
       try {
-        await runScriptsInTerminal(preScriptsDir, workspacePath, workspaceName, config.repository);
-        await runScriptsInTerminal(setupScriptsDir, workspacePath, workspaceName, config.repository);
+        await runScriptsInTerminal(preScriptsDir, workspacePath, workspaceName, config.repository, scriptOptions);
+        await runScriptsInTerminal(setupScriptsDir, workspacePath, workspaceName, config.repository, scriptOptions);
         markSetupComplete(workspacePath);
       } finally {
         renderer.resume();
@@ -655,13 +815,21 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       const existsRemotely = await checkRemoteBranch(baseDir, name);
       await createWorktree(baseDir, workspacePath, name, config.baseBranch, existsRemotely);
 
+      // Build script options with bundle values and secrets
+      const scriptOptions: RunScriptsOptions = {
+        bundleValues: config.bundleValues,
+      };
+      if (config.bundleSecretKeys && config.bundleSecretKeys.length > 0) {
+        scriptOptions.bundleSecrets = await getProjectSecrets(state.currentProject, config.bundleSecretKeys);
+      }
+
       // Run pre and setup scripts during creation
       const preScriptsDir = getScriptsPhaseDir(state.currentProject, 'pre');
       const setupScriptsDir = getScriptsPhaseDir(state.currentProject, 'setup');
       renderer.suspend();
       try {
-        await runScriptsInTerminal(preScriptsDir, workspacePath, name, config.repository);
-        await runScriptsInTerminal(setupScriptsDir, workspacePath, name, config.repository);
+        await runScriptsInTerminal(preScriptsDir, workspacePath, name, config.repository, scriptOptions);
+        await runScriptsInTerminal(setupScriptsDir, workspacePath, name, config.repository, scriptOptions);
         markSetupComplete(workspacePath);
       } finally {
         renderer.resume();
@@ -677,19 +845,36 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
   // Handle delete
   const handleDelete = useCallback(async () => {
-    if (flow.type !== 'confirm-delete' || !state.currentProject) return;
+    if (flow.type !== 'confirm-delete') return;
 
     renderer.stop();
     process.stdout.write('\x1b[2J\x1b[H');
 
     try {
-      await removeWorkspace(flow.target.name, { force: true });
+      if (flow.target.type === 'workspace') {
+        if (!state.currentProject) return;
+        await removeWorkspace(flow.target.name, { force: true });
+        renderer.start();
+        await loadWorkspacesForProject(state.currentProject);
+      } else if (flow.target.type === 'project') {
+        await removeProject(flow.target.name, { force: true });
+        renderer.start();
+        // Refresh projects list
+        const projects = loadProjects();
+        dispatch({ type: 'SET_PROJECTS', projects });
+        // If we deleted the current project, clear selection
+        if (state.currentProject === flow.target.name) {
+          dispatch({ type: 'SET_CURRENT_PROJECT', project: null });
+          dispatch({ type: 'SET_WORKSPACES', workspaces: [] });
+          if (projects.length > 0) {
+            dispatch({ type: 'SELECT_PROJECT', index: 0 });
+          }
+        }
+      }
     } catch (err) {
-      // Ignore
+      // Ignore errors
     }
 
-    renderer.start();
-    await loadWorkspacesForProject(state.currentProject);
     setFlow({ type: 'none' });
   }, [flow, state.currentProject, renderer, loadWorkspacesForProject]);
 
@@ -735,9 +920,17 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
           const config = readProjectConfig(flow.projectName);
           const setupScriptsDir = getScriptsPhaseDir(flow.projectName, 'setup');
 
+          // Build script options with bundle values and secrets
+          const scriptOptions: RunScriptsOptions = {
+            bundleValues: config.bundleValues,
+          };
+          if (config.bundleSecretKeys && config.bundleSecretKeys.length > 0) {
+            scriptOptions.bundleSecrets = await getProjectSecrets(flow.projectName, config.bundleSecretKeys);
+          }
+
           setFlow({ type: 'none' });
           renderer.suspend();
-          await runScriptsInTerminal(setupScriptsDir, workspacePath, flow.workspaceName, config.repository);
+          await runScriptsInTerminal(setupScriptsDir, workspacePath, flow.workspaceName, config.repository, scriptOptions);
           renderer.resume();
 
           if (state.currentProject) {
@@ -758,6 +951,38 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
         } else if (key.name === 'return' || key.name === 'enter') {
           await handleCreateProject(flow.repos[flow.selectedIndex]);
         }
+        return;
+      }
+
+      // Onboarding flow
+      if (flow.type === 'new-project-onboarding') {
+        const currentStepData = flow.steps[flow.currentStep];
+
+        if (currentStepData.type === 'info') {
+          // Info step: Enter to continue
+          if (key.name === 'return' || key.name === 'enter') {
+            await advanceOnboardingStep(flow);
+          }
+          return;
+        }
+
+        if (currentStepData.type === 'confirm') {
+          // Confirm step: Enter to continue (if command found or no check), wait if checking
+          if (flow.confirmStatus === 'checking') {
+            // Still checking, ignore input
+            return;
+          }
+          if (key.name === 'return' || key.name === 'enter') {
+            await advanceOnboardingStep(flow);
+          }
+          return;
+        }
+
+        if (currentStepData.type === 'secret' || currentStepData.type === 'input') {
+          // Input handled by input component - just return to let it handle keys
+          return;
+        }
+
         return;
       }
 
@@ -859,10 +1084,17 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       return;
     }
 
-    if (key.name === 'd' && state.activePanel === 'workspaces' && state.workspaces.length > 0) {
-      const workspace = state.workspaces[state.selectedWorkspaceIndex];
-      if (workspace) {
-        setFlow({ type: 'confirm-delete', target: { type: 'workspace', name: workspace.name } });
+    if (key.name === 'd') {
+      if (state.activePanel === 'workspaces' && state.workspaces.length > 0) {
+        const workspace = state.workspaces[state.selectedWorkspaceIndex];
+        if (workspace) {
+          setFlow({ type: 'confirm-delete', target: { type: 'workspace', name: workspace.name } });
+        }
+      } else if (state.activePanel === 'projects' && state.projects.length > 0) {
+        const project = state.projects[state.selectedProjectIndex];
+        if (project) {
+          setFlow({ type: 'confirm-delete', target: { type: 'project', name: project.name } });
+        }
       }
       return;
     }
@@ -906,9 +1138,12 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
     }
 
     if (flow.type === 'confirm-delete') {
+      const isProject = flow.target.type === 'project';
+      const itemType = isProject ? 'project' : 'workspace';
       return (
-        <Modal title="Confirm Delete" hint="[y] Yes  [n] No" height={6}>
-          <text fg={COLORS.text} height={1} marginTop={1}>Delete workspace "{flow.target.name}"?</text>
+        <Modal title="Confirm Delete" hint="[y] Yes  [n] No" height={7}>
+          <text fg={COLORS.text} height={1} marginTop={1}>Delete {itemType} "{flow.target.name}"?</text>
+          {isProject && <text fg={COLORS.error} height={1}>This will delete all workspaces!</text>}
         </Modal>
       );
     }
@@ -953,10 +1188,94 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
     }
 
     if (flow.type === 'new-project-onboarding') {
+      const currentStepData = flow.steps[flow.currentStep];
+      const stepProgress = `Step ${flow.currentStep + 1} of ${flow.steps.length}`;
+
+      // Info step
+      if (currentStepData.type === 'info') {
+        return (
+          <Modal title={currentStepData.title} hint={`[Enter] Continue  [Esc] Cancel  (${stepProgress})`} height={10} width={70}>
+            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
+          </Modal>
+        );
+      }
+
+      // Confirm step
+      if (currentStepData.type === 'confirm') {
+        let statusText = '';
+        let statusColor = COLORS.text;
+
+        if (currentStepData.checkCommand) {
+          if (flow.confirmStatus === 'checking') {
+            statusText = `Checking for ${currentStepData.checkCommand}...`;
+            statusColor = COLORS.loading;
+          } else if (flow.confirmStatus === 'found') {
+            statusText = `${currentStepData.checkCommand} is installed`;
+            statusColor = COLORS.title;
+          } else if (flow.confirmStatus === 'missing') {
+            statusText = `${currentStepData.checkCommand} not found`;
+            statusColor = COLORS.error;
+          }
+        }
+
+        return (
+          <Modal title={currentStepData.title} hint={flow.confirmStatus === 'checking' ? `Checking... (${stepProgress})` : `[Enter] Continue  [Esc] Cancel  (${stepProgress})`} height={12} width={70}>
+            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
+            {statusText && <text fg={statusColor} paddingTop={1}>{statusText}</text>}
+            {flow.confirmStatus === 'missing' && currentStepData.installUrl && (
+              <text fg={COLORS.textDim} paddingTop={1}>Install: {currentStepData.installUrl}</text>
+            )}
+          </Modal>
+        );
+      }
+
+      // Secret step (stored securely via Bun.secrets)
+      if (currentStepData.type === 'secret') {
+        return (
+          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={11} width={70}>
+            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
+            <text fg={COLORS.textDim}>(Secret will be stored securely in OS keychain)</text>
+            <input
+              placeholder="Enter value"
+              focused
+              value={flow.inputValue}
+              onInput={(v) => setFlow({ ...flow, inputValue: v })}
+              onSubmit={async (v) => {
+                if (!v.trim()) return;
+                // Store secret via Bun.secrets
+                await setProjectSecret(flow.projectName, currentStepData.configKey, v);
+                const newSecretKeys = [...flow.collectedSecretKeys, currentStepData.configKey];
+                await advanceOnboardingStep({ ...flow, collectedSecretKeys: newSecretKeys });
+              }}
+            />
+          </Modal>
+        );
+      }
+
+      // Input step (regular input)
+      if (currentStepData.type === 'input') {
+        return (
+          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={10} width={70}>
+            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
+            <input
+              placeholder={currentStepData.defaultValue || 'Enter value'}
+              focused
+              value={flow.inputValue}
+              onInput={(v) => setFlow({ ...flow, inputValue: v })}
+              onSubmit={async (v) => {
+                const value = v.trim() || currentStepData.defaultValue || '';
+                const newValues = { ...flow.collectedValues, [currentStepData.configKey]: value };
+                await advanceOnboardingStep({ ...flow, collectedValues: newValues });
+              }}
+            />
+          </Modal>
+        );
+      }
+
+      // Fallback
       return (
         <Modal title="Bundle Onboarding" height={6}>
-          <text fg={COLORS.loading} paddingTop={1}>Running onboarding for {flow.projectName}...</text>
-          <text fg={COLORS.textDim}>Check terminal for prompts</text>
+          <text fg={COLORS.loading} paddingTop={1}>Processing step...</text>
         </Modal>
       );
     }

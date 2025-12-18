@@ -46,14 +46,29 @@ export function discoverScripts(scriptsDir: string): string[] {
 }
 
 /**
+ * Options for running scripts
+ */
+export interface RunScriptsOptions {
+  /** Bundle values to pass as SPACE_VALUE_* environment variables */
+  bundleValues?: Record<string, string>;
+  /** Secret values to pass as SPACE_SECRET_* environment variables */
+  bundleSecrets?: Record<string, string>;
+}
+
+/**
  * Run scripts in the current terminal
  * Used for pre-scripts that run before tmux session
+ *
+ * Bundle values are passed as environment variables:
+ * - SPACE_VALUE_<KEY> for regular values (key is uppercased)
+ * - SPACE_SECRET_<KEY> for secret values (key is uppercased)
  */
 export async function runScriptsInTerminal(
   scriptsDir: string,
   workspacePath: string,
   workspaceName: string,
-  repository: string
+  repository: string,
+  options?: RunScriptsOptions
 ): Promise<void> {
   const scripts = discoverScripts(scriptsDir);
 
@@ -65,6 +80,25 @@ export async function runScriptsInTerminal(
   const phaseName = scriptsDir.split('/').pop() || 'scripts';
   logger.info(`Running ${phaseName} scripts...`);
 
+  // Build environment variables from bundle values
+  const scriptEnv: Record<string, string> = { ...process.env } as Record<string, string>;
+
+  // Add bundle values as SPACE_VALUE_<KEY>
+  if (options?.bundleValues) {
+    for (const [key, value] of Object.entries(options.bundleValues)) {
+      const envKey = `SPACE_VALUE_${key.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+      scriptEnv[envKey] = value;
+    }
+  }
+
+  // Add bundle secrets as SPACE_SECRET_<KEY>
+  if (options?.bundleSecrets) {
+    for (const [key, value] of Object.entries(options.bundleSecrets)) {
+      const envKey = `SPACE_SECRET_${key.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+      scriptEnv[envKey] = value;
+    }
+  }
+
   for (const scriptPath of scripts) {
     await new Promise<void>((resolve, reject) => {
       const scriptName = scriptPath.split('/').pop() || scriptPath;
@@ -74,6 +108,7 @@ export async function runScriptsInTerminal(
         stdio: 'inherit',
         shell: false,
         cwd: workspacePath,
+        env: scriptEnv,
       });
 
       child.on('close', (code) => {

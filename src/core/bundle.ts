@@ -29,19 +29,26 @@ const SCRIPT_PHASES = ['pre', 'setup', 'select', 'remove'] as const;
  * Checks common subdirectory names for spaces-bundle.json
  */
 export function detectBundleInRepo(baseDir: string): string | null {
+  logger.debug(`Checking for bundle in: ${baseDir}`);
+
   for (const subdir of BUNDLE_SUBDIRS) {
     const bundlePath = join(baseDir, subdir, BUNDLE_FILENAME);
+    logger.debug(`  Checking: ${bundlePath}`);
     if (existsSync(bundlePath)) {
+      logger.debug(`  Found bundle at: ${bundlePath}`);
       return join(baseDir, subdir);
     }
   }
 
   // Check root level
   const rootBundlePath = join(baseDir, BUNDLE_FILENAME);
+  logger.debug(`  Checking root: ${rootBundlePath}`);
   if (existsSync(rootBundlePath)) {
+    logger.debug(`  Found bundle at root`);
     return baseDir;
   }
 
+  logger.debug(`  No bundle found`);
   return null;
 }
 

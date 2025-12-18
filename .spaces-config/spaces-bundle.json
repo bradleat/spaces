@@ -34,6 +34,13 @@
       "defaultValue": "Developer"
     },
     {
+      "id": "api-token",
+      "type": "secret",
+      "title": "Example API Token",
+      "description": "Enter a sample API token. This demonstrates how secrets are stored securely in your OS keychain.\n\nYou can enter any value - this is just for demonstration.",
+      "configKey": "exampleApiToken"
+    },
+    {
       "id": "ready",
       "type": "info",
       "title": "You're All Set!",

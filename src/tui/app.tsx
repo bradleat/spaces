@@ -6,13 +6,17 @@
 import { createCliRenderer } from '@opentui/core';
 import { createRoot, useKeyboard, useRenderer } from '@opentui/react';
 import { useState, useEffect, useCallback, useReducer } from 'react';
+import { spawn } from 'child_process';
 import {
   loadProjects,
   loadWorkspaces,
+  loadInbox,
   stateReducer,
   createInitialState,
+  buildTree,
   type ProjectState,
   type WorkspaceState,
+  type TreeItem,
 } from './state.js';
 import {
   setCurrentProject,
@@ -80,11 +84,15 @@ const COLORS = {
 };
 
 // Flow types for multi-step dialogs
+// Import WorkspaceSession type for flow state
+import type { WorkspaceSession } from './state.js';
+
 type FlowState =
   | { type: 'none' }
   | { type: 'help' }
-  | { type: 'confirm-delete'; target: { type: 'workspace'; name: string } | { type: 'project'; name: string } }
-  | { type: 'workspace-actions'; projectName: string; workspaceName: string }
+  | { type: 'inbox'; selectedIndex: number; viewingSessionId: string | null }
+  | { type: 'confirm-delete'; target: { type: 'workspace'; name: string } | { type: 'project'; name: string } | { type: 'session'; session: WorkspaceSession; workspaceName: string }; inputValue: string }
+  | { type: 'confirm-steal'; session: WorkspaceSession; workspace: WorkspaceState }
   // New Project flow
   | { type: 'new-project-loading' }
   | { type: 'new-project-select'; repos: string[]; selectedIndex: number }
@@ -111,7 +119,22 @@ type FlowState =
   | { type: 'new-workspace-select-branch'; branches: string[]; selectedIndex: number }
   | { type: 'new-workspace-select-linear'; issues: Array<{ identifier: string; title: string }>; selectedIndex: number }
   | { type: 'new-workspace-manual'; inputValue: string }
-  | { type: 'new-workspace-creating'; name: string };
+  | { type: 'new-workspace-creating'; name: string }
+  // New Session flow
+  | { type: 'new-session-name'; workspace: WorkspaceState; inputValue: string }
+  | { type: 'new-session-creating'; workspace: WorkspaceState; sessionName: string };
+
+// Helper to format relative time
+function formatTimeAgo(timestamp: number): string {
+  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
 
 // ASCII art header lines with colors
 const ASCII_LINES = [
@@ -129,14 +152,261 @@ const ASCII_LINES = [
   { text: '╚══════════════════════════════════════════════════════════════╝', color: COLORS.asciiBox },
 ];
 
-// Header component with colorful ASCII art
-function Header() {
+// Import InboxItem type
+import type { InboxItem } from '../lib/tmux-lite/cli.js';
+
+// Helper to parse session name into project/workspace/session
+// Format: project:workspace:sessionName
+function parseSessionName(sessionName: string): { project: string; workspace: string; session: string } {
+  const parts = sessionName.split(':');
+  return {
+    project: parts[0] || sessionName,
+    workspace: parts[1] || sessionName,
+    session: parts[2] || sessionName,
+  };
+}
+
+// Helper to get icon for inbox item type
+function getInboxIcon(item: InboxItem): string {
+  if (item.type === 'exit') return item.exitCode === 0 ? '✅' : '❌';
+  if (item.type === 'title') return '📝';
+  if (item.type === 'idle') return '⏸️';
+  return '🔔';
+}
+
+function getInboxTypeLabel(item: InboxItem): string {
+  if (item.type === 'exit') return item.exitCode === 0 ? 'Completed' : `Exit code ${item.exitCode}`;
+  if (item.type === 'title') return 'Title Change';
+  if (item.type === 'idle') return 'Activity Complete';
+  return 'Bell';
+}
+
+// Helper to group inbox items by project
+function groupInboxByProject(items: InboxItem[]): Map<string, InboxItem[]> {
+  const groups = new Map<string, InboxItem[]>();
+  for (const item of items) {
+    const { project } = parseSessionName(item.sessionName);
+    if (!groups.has(project)) {
+      groups.set(project, []);
+    }
+    groups.get(project)!.push(item);
+  }
+  return groups;
+}
+
+// Hierarchical grouping: project → workspace → session → items
+interface SessionGroup {
+  session: string;
+  items: InboxItem[];
+}
+
+interface WorkspaceGroup {
+  workspace: string;
+  sessions: SessionGroup[];
+  totalItems: number;
+}
+
+interface ProjectGroup {
+  project: string;
+  workspaces: WorkspaceGroup[];
+  totalItems: number;
+}
+
+function groupInboxHierarchically(items: InboxItem[]): ProjectGroup[] {
+  // Sort all items by timestamp (most recent first)
+  const sortedItems = [...items].sort((a, b) => b.timestamp - a.timestamp);
+
+  // Three-level grouping: project → workspace → session
+  const projectMap = new Map<string, Map<string, Map<string, InboxItem[]>>>();
+  const projectLatest = new Map<string, number>();
+  const workspaceLatest = new Map<string, number>();
+  const sessionLatest = new Map<string, number>();
+
+  for (const item of sortedItems) {
+    const { project, workspace, session } = parseSessionName(item.sessionName);
+    const wsKey = `${project}:${workspace}`;
+    const sessKey = `${project}:${workspace}:${session}`;
+
+    // Track latest timestamp for sorting groups
+    if (!projectLatest.has(project) || item.timestamp > projectLatest.get(project)!) {
+      projectLatest.set(project, item.timestamp);
+    }
+    if (!workspaceLatest.has(wsKey) || item.timestamp > workspaceLatest.get(wsKey)!) {
+      workspaceLatest.set(wsKey, item.timestamp);
+    }
+    if (!sessionLatest.has(sessKey) || item.timestamp > sessionLatest.get(sessKey)!) {
+      sessionLatest.set(sessKey, item.timestamp);
+    }
+
+    if (!projectMap.has(project)) {
+      projectMap.set(project, new Map());
+    }
+    const workspaceMap = projectMap.get(project)!;
+
+    if (!workspaceMap.has(workspace)) {
+      workspaceMap.set(workspace, new Map());
+    }
+    const sessionMap = workspaceMap.get(workspace)!;
+
+    if (!sessionMap.has(session)) {
+      sessionMap.set(session, []);
+    }
+    sessionMap.get(session)!.push(item);
+  }
+
+  const result: ProjectGroup[] = [];
+  for (const [project, workspaceMap] of projectMap) {
+    const workspaces: WorkspaceGroup[] = [];
+    let projectTotal = 0;
+
+    for (const [workspace, sessionMap] of workspaceMap) {
+      const sessions: SessionGroup[] = [];
+      let workspaceTotal = 0;
+
+      for (const [session, sessionItems] of sessionMap) {
+        sessions.push({ session, items: sessionItems });
+        workspaceTotal += sessionItems.length;
+      }
+
+      // Sort sessions by most recent
+      const wsKey = `${project}:${workspace}`;
+      sessions.sort((a, b) => {
+        const aKey = `${wsKey}:${a.session}`;
+        const bKey = `${wsKey}:${b.session}`;
+        return (sessionLatest.get(bKey) || 0) - (sessionLatest.get(aKey) || 0);
+      });
+
+      workspaces.push({ workspace, sessions, totalItems: workspaceTotal });
+      projectTotal += workspaceTotal;
+    }
+
+    // Sort workspaces by most recent
+    workspaces.sort((a, b) => {
+      const aKey = `${project}:${a.workspace}`;
+      const bKey = `${project}:${b.workspace}`;
+      return (workspaceLatest.get(bKey) || 0) - (workspaceLatest.get(aKey) || 0);
+    });
+
+    result.push({ project, workspaces, totalItems: projectTotal });
+  }
+
+  // Sort projects by most recent
+  result.sort((a, b) => (projectLatest.get(b.project) || 0) - (projectLatest.get(a.project) || 0));
+
+  return result;
+}
+
+type InboxDisplayItem =
+  | { type: 'project-header'; project: string; totalItems: number }
+  | { type: 'workspace-header'; workspace: string; itemCount: number; isFirstWorkspace: boolean }
+  | { type: 'session-header'; session: string; itemCount: number; isFirstSession: boolean }
+  | { type: 'item'; item: InboxItem; flatIndex: number };
+
+function buildInboxDisplay(items: InboxItem[]): { displayItems: InboxDisplayItem[]; flatItems: InboxItem[] } {
+  const hierarchical = groupInboxHierarchically(items);
+  const displayItems: InboxDisplayItem[] = [];
+  const flatItems: InboxItem[] = [];
+  let flatIndex = 0;
+
+  for (const projectGroup of hierarchical) {
+    displayItems.push({
+      type: 'project-header',
+      project: projectGroup.project,
+      totalItems: projectGroup.totalItems
+    });
+
+    projectGroup.workspaces.forEach((wsGroup, wsIdx) => {
+      displayItems.push({
+        type: 'workspace-header',
+        workspace: wsGroup.workspace,
+        itemCount: wsGroup.totalItems,
+        isFirstWorkspace: wsIdx === 0
+      });
+
+      wsGroup.sessions.forEach((sessGroup, sessIdx) => {
+        displayItems.push({
+          type: 'session-header',
+          session: sessGroup.session,
+          itemCount: sessGroup.items.length,
+          isFirstSession: sessIdx === 0
+        });
+
+        for (const item of sessGroup.items) {
+          displayItems.push({ type: 'item', item, flatIndex });
+          flatItems.push(item);
+          flatIndex++;
+        }
+      });
+    });
+  }
+
+  return { displayItems, flatItems };
+}
+
+function getSessionItems(items: InboxItem[], sessionId: string): InboxItem[] {
+  return items
+    .filter(item => item.sessionId === sessionId)
+    .sort((a, b) => b.timestamp - a.timestamp);
+}
+
+// Header component with ASCII art on left and compact inbox badge on right
+function Header({ inbox, unreadCount }: { inbox: InboxItem[]; unreadCount: number }) {
+  // Build summary: one line per workspace with notifications
+  const workspaceNotifications: Array<{ project: string; workspace: string; icons: string; count: number }> = [];
+  const wsMap = new Map<string, { project: string; workspace: string; items: InboxItem[] }>();
+
+  for (const item of inbox) {
+    const { project, workspace } = parseSessionName(item.sessionName);
+    const key = `${project}:${workspace}`;
+    if (!wsMap.has(key)) {
+      wsMap.set(key, { project, workspace, items: [] });
+    }
+    wsMap.get(key)!.items.push(item);
+  }
+
+  for (const [, data] of wsMap) {
+    const icons = data.items.slice(0, 3).map(getInboxIcon).join('');
+    workspaceNotifications.push({
+      project: data.project,
+      workspace: data.workspace,
+      icons,
+      count: data.items.length,
+    });
+  }
+
   return (
-    <box flexDirection="column" alignItems="center" width="100%" height={13}>
-      {ASCII_LINES.map((line, i) => (
-        <text key={i} fg={line.color}>{line.text}</text>
-      ))}
-      <text fg={COLORS.textDim}>v{VERSION}</text>
+    <box flexDirection="row" width="100%" height={14}>
+      {/* ASCII art on left - fixed width to prevent compression */}
+      <box flexDirection="column" alignItems="flex-start" paddingLeft={1} width={68}>
+        {ASCII_LINES.map((line, i) => (
+          <text key={i} fg={line.color}>{line.text}</text>
+        ))}
+        <text fg={COLORS.textDim}> v{VERSION}</text>
+      </box>
+
+      {/* Compact inbox badge on right */}
+      <box flexDirection="column" flexGrow={1} paddingLeft={2} paddingTop={2}>
+        {unreadCount > 0 ? (
+          <box flexDirection="column">
+            <text fg={COLORS.title} height={1}>📥 {unreadCount} new notification{unreadCount > 1 ? 's' : ''}</text>
+            <text fg={COLORS.textDim} height={1}>[i] view inbox</text>
+            <text height={1}> </text>
+            {workspaceNotifications.slice(0, 6).map((ws, i) => (
+              <text key={i} fg={COLORS.text} height={1}>
+                {ws.icons} {ws.project}/{ws.workspace}
+              </text>
+            ))}
+            {workspaceNotifications.length > 6 && (
+              <text fg={COLORS.textDim} height={1}>  +{workspaceNotifications.length - 6} more</text>
+            )}
+          </box>
+        ) : (
+          <box flexDirection="column">
+            <text fg={COLORS.textDim} height={1}>📥 No notifications</text>
+            <text fg={COLORS.textDim} height={1}>[i] view inbox</text>
+          </box>
+        )}
+      </box>
     </box>
   );
 }
@@ -184,33 +454,76 @@ function ProjectPanel({
   );
 }
 
-// Workspace panel component
-function WorkspacePanel({
+// Workspace tree panel component
+function WorkspaceTreePanel({
   workspaces,
-  selectedIndex,
+  expandedWorkspaces,
+  selectedTreeIndex,
   focused,
   projectName,
-  onSelect,
 }: {
   workspaces: WorkspaceState[];
-  selectedIndex: number;
+  expandedWorkspaces: Set<string>;
+  selectedTreeIndex: number;
   focused: boolean;
   projectName: string | null;
-  onSelect: (index: number) => void;
 }) {
-  const options = workspaces.map((ws) => {
-    let status = ws.uncommittedChanges > 0 ? `${ws.uncommittedChanges} changes` : 'clean';
-    if (ws.isStale) status += ' (stale)';
-    const branchInfo =
-      ws.ahead > 0 || ws.behind > 0
-        ? `[${ws.branch} +${ws.ahead} -${ws.behind}]`
-        : `[${ws.branch}]`;
-    return {
-      name: ws.name,
-      value: ws.name,
-      description: `${branchInfo} ${status}`,
-    };
-  });
+  const tree = buildTree(workspaces, expandedWorkspaces);
+
+  const renderTreeItem = (item: TreeItem, index: number) => {
+    const isSelected = index === selectedTreeIndex && focused;
+    const prefix = isSelected ? '> ' : '  ';
+
+    if (item.type === 'workspace') {
+      const ws = item.workspace;
+      const expandIcon = expandedWorkspaces.has(ws.name) ? '▼' : '▶';
+      let status = ws.uncommittedChanges > 0 ? `${ws.uncommittedChanges} chg` : 'clean';
+      if (ws.isStale) status += ' (stale)';
+      const branchInfo = `[${ws.branch}]`;
+      const sessionCount = ws.sessions.length > 0 ? ` (${ws.sessions.length})` : '';
+
+      return (
+        <text
+          key={`ws-${ws.name}`}
+          fg={isSelected ? COLORS.selected : COLORS.text}
+          height={1}
+        >
+          {prefix}{expandIcon} {ws.name} {branchInfo} {status}{sessionCount}
+        </text>
+      );
+    }
+
+    if (item.type === 'session') {
+      const session = item.session;
+      const statusIcon = session.attached ? '🟢' : '⚪';
+      const title = session.processTitle || '(shell)';
+      const sessionNum = session.name.split(':').pop() || session.id;
+
+      return (
+        <text
+          key={`sess-${session.id}`}
+          fg={isSelected ? COLORS.selected : COLORS.textDim}
+          height={1}
+        >
+          {prefix}    {statusIcon} #{sessionNum}: {title}
+        </text>
+      );
+    }
+
+    if (item.type === 'new-session') {
+      return (
+        <text
+          key={`new-${item.workspace.name}`}
+          fg={isSelected ? COLORS.selected : COLORS.textDim}
+          height={1}
+        >
+          {prefix}    + New session
+        </text>
+      );
+    }
+
+    return null;
+  };
 
   return (
     <box
@@ -223,20 +536,15 @@ function WorkspacePanel({
       <text fg={COLORS.title} paddingLeft={1}>
         {projectName ? ` Workspaces (${projectName}) ` : ' Workspaces '}
       </text>
-      {workspaces.length > 0 ? (
-        <select
-          options={options}
-          focused={focused}
-          selectedIndex={selectedIndex}
-          showDescription
-          flexGrow={1}
-          onChange={(index) => onSelect(index)}
-        />
-      ) : (
-        <text fg={COLORS.textDim} paddingLeft={2} paddingTop={1}>
-          {projectName ? 'No workspaces. Press [n] to create one.' : 'Select a project first'}
-        </text>
-      )}
+      <box flexDirection="column" paddingLeft={1} paddingTop={1} flexGrow={1}>
+        {workspaces.length > 0 ? (
+          tree.map((item, idx) => renderTreeItem(item, idx))
+        ) : (
+          <text fg={COLORS.textDim}>
+            {projectName ? 'No workspaces. Press [n] to create one.' : 'Select a project'}
+          </text>
+        )}
+      </box>
     </box>
   );
 }
@@ -247,7 +555,7 @@ function StatusBar({ activePanel }: { activePanel: 'projects' | 'workspaces' }) 
   return (
     <box width="100%" height={1} backgroundColor={COLORS.statusBar}>
       <text fg={COLORS.textDim}>
-        {` [Arrows] Navigate  [Tab] Switch  [Enter] Select  [n] ${newAction}  [d] Delete  [?] Help  [q] Quit`}
+        {` [Arrows] Navigate  [Tab] Switch  [Enter] Open/Expand  [n] ${newAction}  [d] Delete  [i] Inbox  [?] Help  [q] Quit`}
       </text>
     </box>
   );
@@ -286,18 +594,23 @@ function Modal({
         borderColor={COLORS.borderFocused}
         backgroundColor="#222222"
         flexDirection="column"
-        padding={1}
       >
-        <text fg={COLORS.title} height={1}>{title}</text>
-        {children}
-        {hint && <text fg={COLORS.textDim} height={1}>{hint}</text>}
+        <text fg={COLORS.title} height={1} paddingLeft={1} paddingTop={1}>{title}</text>
+        <box flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1}>
+          {children}
+        </box>
+        {hint && (
+          <box height={1} backgroundColor={COLORS.statusBar} width="100%">
+            <text fg={COLORS.textDim} paddingLeft={1}>{hint}</text>
+          </box>
+        )}
       </box>
     </box>
   );
 }
 
 // Main App component
-function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projectName: string, workspaceName: string) => Promise<void> }) {
+function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projectName: string, workspaceName: string, sessionName: string) => Promise<void> }) {
   const [state, dispatch] = useReducer(stateReducer, createInitialState());
   const [flow, setFlow] = useState<FlowState>({ type: 'none' });
   const [error, setError] = useState<string | null>(null);
@@ -308,6 +621,10 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
     const load = async () => {
       const projects = loadProjects();
       dispatch({ type: 'SET_PROJECTS', projects });
+
+      // Load inbox
+      const { items: inboxItems, unreadCount } = await loadInbox();
+      dispatch({ type: 'SET_INBOX', inbox: inboxItems, unreadCount });
 
       if (projects.length > 0) {
         const currentIndex = projects.findIndex((p) => p.isCurrent);
@@ -323,24 +640,26 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
     load();
   }, []);
 
+  // Poll inbox every 3 seconds for sync across TUI instances
+  useEffect(() => {
+    const pollInbox = async () => {
+      try {
+        const { items: inboxItems, unreadCount } = await loadInbox();
+        dispatch({ type: 'SET_INBOX', inbox: inboxItems, unreadCount });
+      } catch {
+        // Server might not be running, ignore
+      }
+    };
+
+    const interval = setInterval(pollInbox, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Load workspaces when project changes
   const loadWorkspacesForProject = useCallback(async (projectName: string) => {
     const workspaces = await loadWorkspaces(projectName);
     dispatch({ type: 'SET_WORKSPACES', workspaces });
   }, []);
-
-  // Handle project selection
-  const handleSelectProject = useCallback(async (index: number) => {
-    const project = state.projects[index];
-    if (project) {
-      dispatch({ type: 'SELECT_PROJECT', index });
-      dispatch({ type: 'SET_CURRENT_PROJECT', project: project.name });
-      setCurrentProject(project.name);
-      await loadWorkspacesForProject(project.name);
-      dispatch({ type: 'SET_ACTIVE_PANEL', panel: 'workspaces' });
-      dispatch({ type: 'SELECT_WORKSPACE', index: 0 });
-    }
-  }, [state.projects, loadWorkspacesForProject]);
 
   // Start new project flow
   const startNewProjectFlow = useCallback(async () => {
@@ -847,16 +1166,24 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
   const handleDelete = useCallback(async () => {
     if (flow.type !== 'confirm-delete') return;
 
-    renderer.stop();
-    process.stdout.write('\x1b[2J\x1b[H');
-
     try {
-      if (flow.target.type === 'workspace') {
+      if (flow.target.type === 'session') {
+        // Kill session via tmux-lite
+        const { killSession } = await import('../lib/tmux-lite/cli.js');
+        await killSession(flow.target.session.id);
+        if (state.currentProject) {
+          await loadWorkspacesForProject(state.currentProject);
+        }
+      } else if (flow.target.type === 'workspace') {
         if (!state.currentProject) return;
+        renderer.stop();
+        process.stdout.write('\x1b[2J\x1b[H');
         await removeWorkspace(flow.target.name, { force: true });
         renderer.start();
         await loadWorkspacesForProject(state.currentProject);
       } else if (flow.target.type === 'project') {
+        renderer.stop();
+        process.stdout.write('\x1b[2J\x1b[H');
         await removeProject(flow.target.name, { force: true });
         renderer.start();
         // Refresh projects list
@@ -898,45 +1225,164 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
         return;
       }
 
-      // Confirm delete
-      if (flow.type === 'confirm-delete') {
-        if (key.name === 'y') await handleDelete();
-        else if (key.name === 'n') setFlow({ type: 'none' });
+      // Inbox dialog
+      if (flow.type === 'inbox') {
+        const items = state.inbox;
+        const { flatItems } = buildInboxDisplay(items);
+
+        // If viewing a session thread
+        if (flow.viewingSessionId) {
+          const sessionItems = getSessionItems(items, flow.viewingSessionId);
+          const sessionId = flow.viewingSessionId;
+
+          // Escape goes back to list
+          if (key.name === 'escape') {
+            setFlow({ ...flow, viewingSessionId: null });
+            return;
+          }
+
+          // 'a' attaches to session
+          if (key.name === 'a') {
+            const { clearInbox, listSessions } = await import('../lib/tmux-lite/cli.js');
+            const sessions = await listSessions();
+            const session = sessions.find(s => s.id === sessionId);
+
+            if (session) {
+              setFlow({ type: 'none' });
+
+              const cliPath = new URL('../lib/tmux-lite/cli.ts', import.meta.url).pathname;
+              renderer.suspend();
+              const proc = spawn('bun', ['run', cliPath, 'attach', session.id, '-f'], { stdio: 'inherit' });
+              await new Promise<void>((resolve) => proc.on('exit', () => resolve()));
+              renderer.resume();
+
+              for (const item of sessionItems) {
+                await clearInbox(item.id);
+              }
+
+              if (state.currentProject) {
+                await loadWorkspacesForProject(state.currentProject);
+              }
+              const { items: newItems, unreadCount } = await loadInbox();
+              dispatch({ type: 'SET_INBOX', inbox: newItems, unreadCount });
+            } else {
+              setError('Session no longer exists');
+              for (const item of sessionItems) {
+                await clearInbox(item.id);
+              }
+              const { items: newItems, unreadCount } = await loadInbox();
+              dispatch({ type: 'SET_INBOX', inbox: newItems, unreadCount });
+              setFlow({ ...flow, viewingSessionId: null });
+            }
+            return;
+          }
+
+          // 'x' deletes this session's notifications
+          if (key.name === 'x') {
+            const { clearInbox } = await import('../lib/tmux-lite/cli.js');
+            for (const item of sessionItems) {
+              await clearInbox(item.id);
+            }
+            const { items: newItems, unreadCount } = await loadInbox();
+            dispatch({ type: 'SET_INBOX', inbox: newItems, unreadCount });
+            // Adjust selection and go back to list
+            const newIndex = flow.selectedIndex >= newItems.length ? Math.max(0, newItems.length - 1) : flow.selectedIndex;
+            setFlow({ ...flow, viewingSessionId: null, selectedIndex: newIndex });
+            return;
+          }
+
+          return;
+        }
+
+        // List view handlers
+        // Navigation
+        if (key.name === 'up' || key.name === 'k') {
+          setFlow({ ...flow, selectedIndex: Math.max(0, flow.selectedIndex - 1) });
+          return;
+        }
+        if (key.name === 'down' || key.name === 'j') {
+          const maxIndex = Math.max(0, flatItems.length - 1);
+          setFlow({ ...flow, selectedIndex: Math.min(maxIndex, flow.selectedIndex + 1) });
+          return;
+        }
+
+        // Enter opens detail view
+        if ((key.name === 'return' || key.name === 'enter') && flatItems.length > 0) {
+          const item = flatItems[flow.selectedIndex];
+          if (item) {
+            const sessionItems = items.filter(inboxItem => inboxItem.sessionId === item.sessionId);
+            const unreadItems = sessionItems.filter(inboxItem => !inboxItem.read);
+
+            // Mark thread as read when viewing
+            if (unreadItems.length > 0) {
+              const { markInboxRead } = await import('../lib/tmux-lite/cli.js');
+              for (const unreadItem of unreadItems) {
+                await markInboxRead(unreadItem.id);
+              }
+              const { items: newItems, unreadCount } = await loadInbox();
+              dispatch({ type: 'SET_INBOX', inbox: newItems, unreadCount });
+            }
+            setFlow({ ...flow, viewingSessionId: item.sessionId });
+          }
+          return;
+        }
+
+        // Clear all
+        if (key.name === 'c') {
+          const { clearInbox } = await import('../lib/tmux-lite/cli.js');
+          await clearInbox();
+          dispatch({ type: 'SET_INBOX', inbox: [], unreadCount: 0 });
+          setFlow({ type: 'none' });
+          return;
+        }
+
+        // Delete selected item from list
+        if (key.name === 'x' && flatItems.length > 0) {
+          const item = flatItems[flow.selectedIndex];
+          if (item) {
+            const { clearInbox } = await import('../lib/tmux-lite/cli.js');
+            await clearInbox(item.id);
+            const { items: newItems, unreadCount } = await loadInbox();
+            dispatch({ type: 'SET_INBOX', inbox: newItems, unreadCount });
+            if (flow.selectedIndex >= newItems.length && newItems.length > 0) {
+              setFlow({ ...flow, selectedIndex: newItems.length - 1 });
+            }
+          }
+          return;
+        }
+
         return;
       }
 
-      // Workspace actions
-      if (flow.type === 'workspace-actions') {
-        if (key.name === 'o' || key.name === 'return' || key.name === 'enter') {
-          setFlow({ type: 'none' });
-          await onOpenShell(flow.projectName, flow.workspaceName);
-          if (state.currentProject) {
-            await loadWorkspacesForProject(state.currentProject);
-          }
-        } else if (key.name === 's') {
-          // Re-run setup scripts
-          const workspacesDir = getProjectWorkspacesDir(flow.projectName);
-          const workspacePath = join(workspacesDir, flow.workspaceName);
-          const config = readProjectConfig(flow.projectName);
-          const setupScriptsDir = getScriptsPhaseDir(flow.projectName, 'setup');
+      // Confirm delete - for sessions use y/n, for projects/workspaces require typing name
+      if (flow.type === 'confirm-delete') {
+        if (flow.target.type === 'session') {
+          // Quick y/n for sessions
+          if (key.name === 'y') await handleDelete();
+          else if (key.name === 'n') setFlow({ type: 'none' });
+        }
+        // For projects/workspaces, let input component handle it
+        return;
+      }
 
-          // Build script options with bundle values and secrets
-          const scriptOptions: RunScriptsOptions = {
-            bundleValues: config.bundleValues,
-          };
-          if (config.bundleSecretKeys && config.bundleSecretKeys.length > 0) {
-            scriptOptions.bundleSecrets = await getProjectSecrets(flow.projectName, config.bundleSecretKeys);
-          }
-
+      // Confirm steal session
+      if (flow.type === 'confirm-steal') {
+        if (key.name === 'y') {
+          // Force attach to steal
+          const cliPath = new URL('../lib/tmux-lite/cli.ts', import.meta.url).pathname;
           setFlow({ type: 'none' });
           renderer.suspend();
-          await runScriptsInTerminal(setupScriptsDir, workspacePath, flow.workspaceName, config.repository, scriptOptions);
+          const proc = spawn('bun', ['run', cliPath, 'attach', flow.session.id, '-f'], { stdio: 'inherit' });
+          await new Promise<void>((resolve) => proc.on('exit', () => resolve()));
           renderer.resume();
 
+          // Refresh
           if (state.currentProject) {
             await loadWorkspacesForProject(state.currentProject);
+            const { items: inboxItems, unreadCount } = await loadInbox();
+            dispatch({ type: 'SET_INBOX', inbox: inboxItems, unreadCount });
           }
-        } else if (key.name === 'c') {
+        } else if (key.name === 'n') {
           setFlow({ type: 'none' });
         }
         return;
@@ -1039,6 +1485,11 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
         return;
       }
 
+      // Session name input - let input component handle it
+      if (flow.type === 'new-session-name') {
+        return;
+      }
+
       return;
     }
 
@@ -1054,22 +1505,82 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
     }
 
     if (key.name === 'up' || key.name === 'k') {
-      dispatch({ type: 'MOVE_UP' });
+      if (state.activePanel === 'projects' && state.projects.length > 0) {
+        const newIndex = Math.max(0, state.selectedProjectIndex - 1);
+        if (newIndex !== state.selectedProjectIndex) {
+          dispatch({ type: 'SELECT_PROJECT', index: newIndex });
+          // Auto-load workspaces for highlighted project
+          const project = state.projects[newIndex];
+          if (project) {
+            dispatch({ type: 'SET_CURRENT_PROJECT', project: project.name });
+            setCurrentProject(project.name);
+            loadWorkspacesForProject(project.name);
+          }
+        }
+      } else {
+        dispatch({ type: 'MOVE_UP' });
+      }
       return;
     }
 
     if (key.name === 'down' || key.name === 'j') {
-      dispatch({ type: 'MOVE_DOWN' });
+      if (state.activePanel === 'projects' && state.projects.length > 0) {
+        const newIndex = Math.min(state.projects.length - 1, state.selectedProjectIndex + 1);
+        if (newIndex !== state.selectedProjectIndex) {
+          dispatch({ type: 'SELECT_PROJECT', index: newIndex });
+          // Auto-load workspaces for highlighted project
+          const project = state.projects[newIndex];
+          if (project) {
+            dispatch({ type: 'SET_CURRENT_PROJECT', project: project.name });
+            setCurrentProject(project.name);
+            loadWorkspacesForProject(project.name);
+          }
+        }
+      } else {
+        dispatch({ type: 'MOVE_DOWN' });
+      }
       return;
     }
 
     if (key.name === 'return' || key.name === 'enter') {
       if (state.activePanel === 'projects' && state.projects.length > 0) {
-        await handleSelectProject(state.selectedProjectIndex);
+        // Switch to workspaces panel
+        dispatch({ type: 'SET_ACTIVE_PANEL', panel: 'workspaces' });
       } else if (state.activePanel === 'workspaces' && state.workspaces.length > 0 && state.currentProject) {
-        const workspace = state.workspaces[state.selectedWorkspaceIndex];
-        if (workspace) {
-          setFlow({ type: 'workspace-actions', projectName: state.currentProject, workspaceName: workspace.name });
+        const tree = buildTree(state.workspaces, state.expandedWorkspaces);
+        const item = tree[state.selectedTreeIndex];
+
+        if (item) {
+          if (item.type === 'workspace') {
+            // Toggle expand/collapse
+            dispatch({ type: 'TOGGLE_WORKSPACE', workspaceName: item.workspace.name });
+          } else if (item.type === 'session') {
+            // Attach to session directly
+            const session = item.session;
+            if (session.attached) {
+              // Session is attached elsewhere, show steal confirmation
+              setFlow({
+                type: 'confirm-steal',
+                session,
+                workspace: item.workspace,
+              });
+            } else {
+              // Attach directly
+              const cliPath = new URL('../lib/tmux-lite/cli.ts', import.meta.url).pathname;
+              renderer.suspend();
+              const proc = spawn('bun', ['run', cliPath, 'attach', session.id], { stdio: 'inherit' });
+              await new Promise<void>((resolve) => proc.on('exit', () => resolve()));
+              renderer.resume();
+
+              // Refresh
+              await loadWorkspacesForProject(state.currentProject);
+              const { items: inboxItems, unreadCount } = await loadInbox();
+              dispatch({ type: 'SET_INBOX', inbox: inboxItems, unreadCount });
+            }
+          } else if (item.type === 'new-session') {
+            // Show session name input flow
+            setFlow({ type: 'new-session-name', workspace: item.workspace, inputValue: '' });
+          }
         }
       }
       return;
@@ -1086,14 +1597,21 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
     if (key.name === 'd') {
       if (state.activePanel === 'workspaces' && state.workspaces.length > 0) {
-        const workspace = state.workspaces[state.selectedWorkspaceIndex];
-        if (workspace) {
-          setFlow({ type: 'confirm-delete', target: { type: 'workspace', name: workspace.name } });
+        const tree = buildTree(state.workspaces, state.expandedWorkspaces);
+        const item = tree[state.selectedTreeIndex];
+
+        if (item) {
+          if (item.type === 'workspace') {
+            setFlow({ type: 'confirm-delete', target: { type: 'workspace', name: item.workspace.name }, inputValue: '' });
+          } else if (item.type === 'session') {
+            setFlow({ type: 'confirm-delete', target: { type: 'session', session: item.session, workspaceName: item.workspace.name }, inputValue: '' });
+          }
+          // Can't delete 'new-session' item
         }
       } else if (state.activePanel === 'projects' && state.projects.length > 0) {
         const project = state.projects[state.selectedProjectIndex];
         if (project) {
-          setFlow({ type: 'confirm-delete', target: { type: 'project', name: project.name } });
+          setFlow({ type: 'confirm-delete', target: { type: 'project', name: project.name }, inputValue: '' });
         }
       }
       return;
@@ -1101,6 +1619,11 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
     if (key.name === '?' || (key.shift && key.name === '/')) {
       setFlow({ type: 'help' });
+      return;
+    }
+
+    if (key.name === 'i') {
+      setFlow({ type: 'inbox', selectedIndex: 0, viewingSessionId: null });
       return;
     }
 
@@ -1128,6 +1651,7 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
               'Arrows/jk  Navigate list',
               'n          New project / workspace',
               'd          Delete selected workspace',
+              'i          Show inbox',
               'r          Refresh lists',
               '?          Show this help',
               'q          Quit',
@@ -1137,21 +1661,75 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       );
     }
 
+    // Inbox is rendered as full-screen, not a modal - handled in main render
+    if (flow.type === 'inbox') {
+      return null;
+    }
+
     if (flow.type === 'confirm-delete') {
-      const isProject = flow.target.type === 'project';
-      const itemType = isProject ? 'project' : 'workspace';
+      let itemType: string;
+      let itemName: string;
+      let warning: string | null = null;
+
+      if (flow.target.type === 'project') {
+        itemType = 'project';
+        itemName = flow.target.name;
+        warning = 'This will delete all workspaces!';
+      } else if (flow.target.type === 'workspace') {
+        itemType = 'workspace';
+        itemName = flow.target.name;
+        warning = 'This will delete all sessions in this workspace!';
+      } else {
+        itemType = 'session';
+        const sessionNum = flow.target.session.name.split(':').pop() || flow.target.session.id;
+        itemName = `#${sessionNum}`;
+      }
+
+      // For sessions, use simple y/n confirmation
+      if (flow.target.type === 'session') {
+        return (
+          <Modal title="Confirm Delete" hint="[y] Yes  [n] No" height={6}>
+            <text fg={COLORS.text} height={1} marginTop={1}>Delete {itemType} "{itemName}"?</text>
+          </Modal>
+        );
+      }
+
+      // For projects and workspaces, require typing the name
+      const handleDeleteWithConfirmation = async (typedName: string) => {
+        if (typedName.trim() === itemName) {
+          await handleDelete();
+        } else {
+          setError(`Name doesn't match. Type "${itemName}" to confirm.`);
+        }
+      };
+
       return (
-        <Modal title="Confirm Delete" hint="[y] Yes  [n] No" height={7}>
-          <text fg={COLORS.text} height={1} marginTop={1}>Delete {itemType} "{flow.target.name}"?</text>
-          {isProject && <text fg={COLORS.error} height={1}>This will delete all workspaces!</text>}
+        <Modal title="Confirm Delete" hint="[Enter] Delete  [Esc] Cancel" height={11}>
+          <box flexDirection="column" flexGrow={1}>
+            <text fg={COLORS.error} height={1} marginTop={1}>{warning}</text>
+            <text height={1}> </text>
+            <text fg={COLORS.text} height={1}>Type "{itemName}" to confirm:</text>
+            <text height={1}> </text>
+            <input
+              placeholder={itemName}
+              focused
+              value={flow.inputValue}
+              onInput={(v) => setFlow({ ...flow, inputValue: v })}
+              onSubmit={handleDeleteWithConfirmation}
+            />
+          </box>
         </Modal>
       );
     }
 
-    if (flow.type === 'workspace-actions') {
+    if (flow.type === 'confirm-steal') {
+      const sessionNum = flow.session.name.split(':').pop() || flow.session.id;
+      const title = flow.session.processTitle || '(shell)';
       return (
-        <Modal title={`Workspace: ${flow.workspaceName}`} hint="[o/Enter] Open  [s] Re-run Setup  [Esc] Cancel" height={6}>
-          <text fg={COLORS.text} height={1} marginTop={1}>What would you like to do?</text>
+        <Modal title="Steal Session?" hint="[y] Yes  [n] No" height={8}>
+          <text fg={COLORS.text} height={1} marginTop={1}>Session #{sessionNum} is attached elsewhere.</text>
+          <text fg={COLORS.textDim} height={1}>Running: {title}</text>
+          <text fg={COLORS.loading} height={1}>Steal this session?</text>
         </Modal>
       );
     }
@@ -1232,22 +1810,25 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       // Secret step (stored securely via Bun.secrets)
       if (currentStepData.type === 'secret') {
         return (
-          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={11} width={70}>
-            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
-            <text fg={COLORS.textDim}>(Secret will be stored securely in OS keychain)</text>
-            <input
-              placeholder="Enter value"
-              focused
-              value={flow.inputValue}
-              onInput={(v) => setFlow({ ...flow, inputValue: v })}
-              onSubmit={async (v) => {
-                if (!v.trim()) return;
-                // Store secret via Bun.secrets
-                await setProjectSecret(flow.projectName, currentStepData.configKey, v);
-                const newSecretKeys = [...flow.collectedSecretKeys, currentStepData.configKey];
-                await advanceOnboardingStep({ ...flow, collectedSecretKeys: newSecretKeys });
-              }}
-            />
+          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={12} width={70}>
+            <box flexDirection="column" flexGrow={1}>
+              <text fg={COLORS.text} height={1} marginTop={1}>{currentStepData.description}</text>
+              <text fg={COLORS.textDim} height={1}>(Secret will be stored securely in OS keychain)</text>
+              <text height={1}> </text>
+              <input
+                placeholder="Enter value"
+                focused
+                value={flow.inputValue}
+                onInput={(v) => setFlow({ ...flow, inputValue: v })}
+                onSubmit={async (v) => {
+                  if (!v.trim()) return;
+                  // Store secret via Bun.secrets
+                  await setProjectSecret(flow.projectName, currentStepData.configKey, v);
+                  const newSecretKeys = [...flow.collectedSecretKeys, currentStepData.configKey];
+                  await advanceOnboardingStep({ ...flow, collectedSecretKeys: newSecretKeys });
+                }}
+              />
+            </box>
           </Modal>
         );
       }
@@ -1255,19 +1836,22 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       // Input step (regular input)
       if (currentStepData.type === 'input') {
         return (
-          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={10} width={70}>
-            <text fg={COLORS.text} paddingTop={1}>{currentStepData.description}</text>
-            <input
-              placeholder={currentStepData.defaultValue || 'Enter value'}
-              focused
-              value={flow.inputValue}
-              onInput={(v) => setFlow({ ...flow, inputValue: v })}
-              onSubmit={async (v) => {
-                const value = v.trim() || currentStepData.defaultValue || '';
-                const newValues = { ...flow.collectedValues, [currentStepData.configKey]: value };
-                await advanceOnboardingStep({ ...flow, collectedValues: newValues });
-              }}
-            />
+          <Modal title={currentStepData.title} hint={`[Enter] Submit  [Esc] Cancel  (${stepProgress})`} height={11} width={70}>
+            <box flexDirection="column" flexGrow={1}>
+              <text fg={COLORS.text} height={1} marginTop={1}>{currentStepData.description}</text>
+              <text height={1}> </text>
+              <input
+                placeholder={currentStepData.defaultValue || 'Enter value'}
+                focused
+                value={flow.inputValue}
+                onInput={(v) => setFlow({ ...flow, inputValue: v })}
+                onSubmit={async (v) => {
+                  const value = v.trim() || currentStepData.defaultValue || '';
+                  const newValues = { ...flow.collectedValues, [currentStepData.configKey]: value };
+                  await advanceOnboardingStep({ ...flow, collectedValues: newValues });
+                }}
+              />
+            </box>
           </Modal>
         );
       }
@@ -1339,15 +1923,18 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
 
     if (flow.type === 'new-workspace-manual') {
       return (
-        <Modal title="New Workspace" hint="[Enter] Create  [Esc] Cancel" height={7}>
-          <text fg={COLORS.textDim} paddingTop={1}>Enter workspace name:</text>
-          <input
-            placeholder="my-feature"
-            focused
-            value={flow.inputValue}
-            onInput={(v) => setFlow({ ...flow, inputValue: v })}
-            onSubmit={(v) => createWorkspaceManual(v)}
-          />
+        <Modal title="New Workspace" hint="[Enter] Create  [Esc] Cancel" height={9}>
+          <box flexDirection="column" flexGrow={1}>
+            <text fg={COLORS.textDim} height={1} marginTop={1}>Enter workspace name:</text>
+            <text height={1}> </text>
+            <input
+              placeholder="my-feature"
+              focused
+              value={flow.inputValue}
+              onInput={(v) => setFlow({ ...flow, inputValue: v })}
+              onSubmit={(v) => createWorkspaceManual(v)}
+            />
+          </box>
         </Modal>
       );
     }
@@ -1360,12 +1947,192 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
       );
     }
 
+    if (flow.type === 'new-session-name') {
+      const createSessionWithName = async (name: string) => {
+        if (!name.trim()) return;
+        setFlow({ type: 'new-session-creating', workspace: flow.workspace, sessionName: name.trim() });
+        try {
+          await onOpenShell(state.currentProject!, flow.workspace.name, name.trim());
+          await loadWorkspacesForProject(state.currentProject!);
+          const { items: inboxItems, unreadCount } = await loadInbox();
+          dispatch({ type: 'SET_INBOX', inbox: inboxItems, unreadCount });
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Failed to create session');
+        }
+        setFlow({ type: 'none' });
+      };
+
+      return (
+        <Modal title="New Session" hint="[Enter] Create  [Esc] Cancel" height={9}>
+          <box flexDirection="column" flexGrow={1}>
+            <text fg={COLORS.textDim} height={1} marginTop={1}>Enter session name:</text>
+            <text height={1}> </text>
+            <input
+              placeholder="main"
+              focused
+              value={flow.inputValue}
+              onInput={(v) => setFlow({ ...flow, inputValue: v })}
+              onSubmit={createSessionWithName}
+            />
+          </box>
+        </Modal>
+      );
+    }
+
+    if (flow.type === 'new-session-creating') {
+      return (
+        <Modal title="New Session" height={5}>
+          <text fg={COLORS.loading} paddingTop={1}>Creating session "{flow.sessionName}"...</text>
+        </Modal>
+      );
+    }
+
     return null;
   };
 
+  // Full-screen inbox view
+  if (flow.type === 'inbox') {
+    const items = state.inbox;
+
+    // Detail view for a session thread
+    if (flow.viewingSessionId) {
+      const sessionItems = getSessionItems(items, flow.viewingSessionId);
+      const sessionName = sessionItems[0]?.sessionName;
+      const sessionParts = sessionName ? parseSessionName(sessionName) : null;
+      const sessionLabel = sessionParts
+        ? `${sessionParts.project} / ${sessionParts.workspace} / ${sessionParts.session}`
+        : 'Session';
+      const maxLinesPerItem = 8;
+
+      return (
+        <box flexDirection="column" width="100%" height="100%">
+          <box flexDirection="column" border borderStyle="single" borderColor={COLORS.borderFocused} flexGrow={1} margin={1}>
+            <text fg={COLORS.title} paddingLeft={1} height={1}>
+              {` 📥 ${sessionLabel}${sessionItems.length > 0 ? ` (${sessionItems.length} notification${sessionItems.length > 1 ? 's' : ''})` : ''} `}
+            </text>
+            <box flexDirection="column" padding={1} flexGrow={1}>
+              {sessionItems.length > 0 ? (
+                sessionItems.map((item, itemIdx) => {
+                  const timeAgo = formatTimeAgo(item.timestamp);
+                  const typeLabel = getInboxTypeLabel(item);
+                  const icon = getInboxIcon(item);
+                  const lines = item.context.split('\n');
+                  const previewLines = lines.slice(0, maxLinesPerItem);
+                  const remainingLines = Math.max(0, lines.length - previewLines.length);
+
+                  return (
+                    <box key={item.id} flexDirection="column" marginBottom={itemIdx === sessionItems.length - 1 ? 0 : 1}>
+                      <text fg={COLORS.title} height={1}>{icon} {typeLabel} · {timeAgo}</text>
+                      {item.processTitle && <text fg={COLORS.loading} height={1}>Process: {item.processTitle}</text>}
+                      <box flexDirection="column" paddingLeft={1} marginTop={1}>
+                        {previewLines.map((line, lineIdx) => (
+                          <text key={lineIdx} fg={COLORS.textDim} height={1}>{line}</text>
+                        ))}
+                        {remainingLines > 0 && (
+                          <text fg={COLORS.textDim} height={1}>... ({remainingLines} more lines)</text>
+                        )}
+                      </box>
+                    </box>
+                  );
+                })
+              ) : (
+                <text fg={COLORS.textDim} height={1}>No notifications for this session.</text>
+              )}
+            </box>
+          </box>
+          <box width="100%" height={1} backgroundColor={COLORS.statusBar}>
+            <text fg={COLORS.textDim}> [a] Attach to session  [x] Delete  [Esc] Back to list</text>
+          </box>
+        </box>
+      );
+    }
+
+    const { displayItems } = buildInboxDisplay(items);
+
+    // Inbox list view - hierarchical grouped with tree connectors
+    return (
+      <box flexDirection="column" width="100%" height="100%">
+        <box flexDirection="column" border borderStyle="single" borderColor={COLORS.borderFocused} flexGrow={1} margin={1}>
+          <text fg={COLORS.title} paddingLeft={1} height={1}>
+            {` 📥 INBOX ${state.unreadCount > 0 ? `(${state.unreadCount} unread)` : ''} `}
+          </text>
+          <box flexDirection="column" padding={1} flexGrow={1}>
+            {items.length > 0 ? (
+              displayItems.map((displayItem, displayIdx) => {
+                if (displayItem.type === 'project-header') {
+                  // Project header - prominent block
+                  return (
+                    <box key={`project-${displayItem.project}`} flexDirection="column">
+                      {displayIdx > 0 && <text height={1}> </text>}
+                      <text fg={COLORS.title} height={1}>
+                        ┌─ 📁 {displayItem.project} ({displayItem.totalItems} notification{displayItem.totalItems > 1 ? 's' : ''})
+                      </text>
+                    </box>
+                  );
+                } else if (displayItem.type === 'workspace-header') {
+                  // Workspace header - indented with tree connector
+                  return (
+                    <box key={`workspace-${displayItem.workspace}`} flexDirection="column">
+                      {!displayItem.isFirstWorkspace && <text fg={COLORS.border} height={1}>│</text>}
+                      <text fg={COLORS.loading} height={1}>
+                        │  ┌─ 📂 {displayItem.workspace}
+                      </text>
+                    </box>
+                  );
+                } else if (displayItem.type === 'session-header') {
+                  // Session header - further indented
+                  return (
+                    <box key={`session-${displayItem.session}`} flexDirection="column">
+                      <text fg={COLORS.textDim} height={1}>
+                        │  │  ├─ 💻 {displayItem.session}
+                      </text>
+                    </box>
+                  );
+                } else {
+                  // Notification item - deepest indentation with selection highlight
+                  const { item } = displayItem;
+                  const isSelected = displayItem.flatIndex === flow.selectedIndex;
+                  const timeAgo = formatTimeAgo(item.timestamp);
+                  const icon = getInboxIcon(item);
+                  const readIndicator = item.read ? ' ' : '•';
+                  const prefix = isSelected ? '▶' : ' ';
+                  const processInfo = item.processTitle || '';
+                  const context = item.context.split('\n')[0].substring(0, 40);
+
+                  return (
+                    <box key={item.id} flexDirection="column">
+                      <text
+                        fg={isSelected ? COLORS.selected : item.read ? COLORS.textDim : COLORS.text}
+                        height={1}
+                      >
+                        │  │  │   {prefix}{readIndicator} {icon} {processInfo}{processInfo ? ' · ' : ''}{timeAgo}
+                      </text>
+                      <text
+                        fg={isSelected ? COLORS.selected : COLORS.textDim}
+                        height={1}
+                      >
+                        │  │  │      {context}
+                      </text>
+                    </box>
+                  );
+                }
+              })
+            ) : (
+              <text fg={COLORS.textDim}>No notifications</text>
+            )}
+          </box>
+        </box>
+        <box width="100%" height={1} backgroundColor={COLORS.statusBar}>
+          <text fg={COLORS.textDim}> [↑↓] Navigate  [Enter] View  [x] Delete  [c] Clear all  [Esc] Back</text>
+        </box>
+      </box>
+    );
+  }
+
+  // Main view
   return (
     <box flexDirection="column" width="100%" height="100%">
-      <Header />
+      <Header inbox={state.inbox} unreadCount={state.unreadCount} />
 
       <box flexDirection="row" flexGrow={1} width="100%" gap={1} paddingLeft={1} paddingRight={1}>
         <ProjectPanel
@@ -1374,12 +2141,12 @@ function App({ onQuit, onOpenShell }: { onQuit: () => void; onOpenShell: (projec
           focused={state.activePanel === 'projects' && flow.type === 'none'}
           onNavigate={(index) => dispatch({ type: 'SELECT_PROJECT', index })}
         />
-        <WorkspacePanel
+        <WorkspaceTreePanel
           workspaces={state.workspaces}
-          selectedIndex={state.selectedWorkspaceIndex}
+          expandedWorkspaces={state.expandedWorkspaces}
+          selectedTreeIndex={state.selectedTreeIndex}
           focused={state.activePanel === 'workspaces' && flow.type === 'none'}
           projectName={state.currentProject}
-          onSelect={(index) => dispatch({ type: 'SELECT_WORKSPACE', index })}
         />
       </box>
 
@@ -1419,7 +2186,7 @@ export async function launchTUI(): Promise<void> {
     process.exit(0);
   };
 
-  const handleOpenShell = async (projectName: string, workspaceName: string) => {
+  const handleOpenShell = async (projectName: string, workspaceName: string, sessionName: string) => {
     const workspacesDir = getProjectWorkspacesDir(projectName);
     const workspacePath = join(workspacesDir, workspaceName);
     const config = readProjectConfig(projectName);
@@ -1428,7 +2195,7 @@ export async function launchTUI(): Promise<void> {
 
     try {
       // TUI handles setup during creation, so just run select scripts
-      await openWorkspaceShell(workspacePath, projectName, config.repository, false, true);
+      await openWorkspaceShell(workspacePath, projectName, config.repository, false, true, sessionName);
     } catch (err) {
       // Ignore
     }

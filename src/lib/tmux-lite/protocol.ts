@@ -10,14 +10,18 @@ export type Command =
   | { type: "new"; name?: string; cwd: string }
   | { type: "attach"; id: string; force?: boolean }
   | { type: "kill"; id: string }
-  | { type: "kill-server" };
+  | { type: "kill-server" }
+  | { type: "inbox" }
+  | { type: "inbox-clear"; id?: string }  // Clear one or all
+  | { type: "inbox-read"; id: string };   // Mark as read
 
 export type Response =
   | { type: "sessions"; sessions: Session[] }
   | { type: "session"; session: Session }
   | { type: "already-attached"; session: Session }
   | { type: "ok" }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "inbox"; items: InboxItem[] };
 
 export interface Session {
   id: string;
@@ -27,6 +31,21 @@ export interface Session {
   attached: boolean;
   cwd: string;
   createdAt: number;
+  exitCode?: number;  // undefined = running, number = exited
+  processTitle?: string;  // Title set by running process (e.g., vim, npm run dev)
+}
+
+// Inbox item - things that need attention
+export interface InboxItem {
+  id: string;
+  sessionId: string;
+  sessionName: string;
+  type: 'bell' | 'exit' | 'title' | 'idle';
+  timestamp: number;
+  exitCode?: number;
+  context: string;  // The actual message/output
+  processTitle?: string;  // What process was running (e.g., "claude", "npm run dev")
+  read: boolean;
 }
 
 // Session control (binary protocol)

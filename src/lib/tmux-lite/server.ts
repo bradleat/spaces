@@ -5,11 +5,13 @@
  * Uses xterm-headless for proper terminal state tracking
  */
 
-import { unlinkSync } from "fs";
+import { existsSync, mkdirSync, unlinkSync } from "fs";
+import { dirname } from "path";
 import { Terminal as XTerminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import {
-  ROUTER_SOCKET,
+  getRouterSocket,
+  getSessionSocketPath,
   type Command,
   type Response,
   type Session,
@@ -20,6 +22,14 @@ import {
   decode,
   ctrlMsgLen,
 } from "./protocol";
+
+const rawArgs = process.argv.slice(2);
+if (rawArgs.includes("--test")) {
+  process.env.TMUX_LITE_SOCKET = "/tmp/tmux-lite-test.sock";
+  process.env.TMUX_LITE_SESSION_DIR = "/tmp/tmux-lite-test";
+}
+
+const ROUTER_SOCKET = getRouterSocket();
 
 // Clean up
 try { unlinkSync(ROUTER_SOCKET); } catch {}
@@ -35,6 +45,8 @@ interface SessionData {
   pendingWrites: number;  // Track pending xterm writes
   attaching: boolean;
   attachBuffer: Buffer[];
+  attachPending: boolean;
+  attachTimer: any;
   processTitle: string;   // Title set by running process (via OSC 0)
   lastInteraction: number;  // Timestamp of last user input
   lastDetached: number;  // Timestamp of last detach (for grace period)
@@ -165,7 +177,11 @@ const TERM_RESET = Buffer.from("\x1bc");
 function createSession(name: string | undefined, cwd: string): Session {
   const id = genId();
   const sessionName = name || `session-${id}`;
-  const socketPath = `/tmp/tmux-lite-${id}.sock`;
+  const socketPath = getSessionSocketPath(id);
+  const socketDir = dirname(socketPath);
+  if (!existsSync(socketDir)) {
+    mkdirSync(socketDir, { recursive: true });
+  }
 
   const cols = process.stdout.columns || 80;
   const rows = process.stdout.rows || 24;
@@ -491,6 +507,108 @@ function createSession(name: string | undefined, cwd: string): Session {
     createdAt: Date.now(),
   };
 
+  const clearAttachTimer = (session: SessionData) => {
+    if (session.attachTimer) {
+      clearTimeout(session.attachTimer);
+      session.attachTimer = null;
+    }
+  };
+
+  const sendCursorState = (session: SessionData, socket: any) => {
+    const core = (session.xterm as any)._core;
+    const isCursorHidden = core?.coreService?.isCursorHidden;
+    if (typeof isCursorHidden === "boolean") {
+      socket.write(Buffer.from(isCursorHidden ? "\x1b[?25l" : "\x1b[?25h"));
+    }
+
+    const cursorStyle = session.xterm.options.cursorStyle;
+    const cursorBlink = session.xterm.options.cursorBlink;
+    let cursorStyleParam: number | null = null;
+    if (cursorStyle === "block") {
+      cursorStyleParam = cursorBlink ? 2 : 1;
+    } else if (cursorStyle === "underline") {
+      cursorStyleParam = cursorBlink ? 4 : 3;
+    } else if (cursorStyle === "bar") {
+      cursorStyleParam = cursorBlink ? 6 : 5;
+    }
+    if (cursorStyleParam !== null) {
+      socket.write(Buffer.from(`\x1b[${cursorStyleParam} q`));
+    }
+  };
+
+  const startAttach = (session: SessionData) => {
+    if (!session.attachPending || !session.client) return;
+    session.attachPending = false;
+    clearAttachTimer(session);
+
+    const socket = session.client;
+
+    // Wait for any pending xterm writes to complete
+    const sendState = () => {
+      if (session.pendingWrites > 0) {
+        setTimeout(sendState, 10);
+        return;
+      }
+
+      try {
+        // Get serialized terminal state (including modes) for consistent redraws
+        const serialized = session.serialize.serialize();
+
+        // Send reset first to clear any bad modes, then restore content
+        socket.write(TERM_RESET);
+        socket.write(Buffer.from("\x1b[2J\x1b[H")); // clear + home
+        socket.write(Buffer.from(serialized));
+
+        console.log(`[${sessionName}] attached (restored ${serialized.length} chars)`);
+      } catch (e) {
+        console.log(`[${sessionName}] serialize error:`, e);
+        // Fallback: just send a reset
+        socket.write(TERM_RESET);
+        socket.write(Buffer.from("\x1b[2J\x1b[H"));
+      }
+
+      sendCursorState(session, socket);
+
+      socket.write(encode({ type: "attach-ready", cols: session.xterm.cols, rows: session.xterm.rows }));
+
+      const drainAttachBuffer = () => {
+        const buffered = session.attachBuffer;
+        session.attachBuffer = [];
+        for (const chunk of buffered) {
+          session.pendingWrites++;
+          session.xterm.write(chunk, () => {
+            session.pendingWrites--;
+          });
+          socket.write(chunk);
+        }
+      };
+
+      const attachStart = Date.now();
+      const finalizeAttach = () => {
+        if (session.attachBuffer.length > 0) {
+          drainAttachBuffer();
+        }
+
+        if ((session.pendingWrites > 0 || session.attachBuffer.length > 0) &&
+            Date.now() - attachStart < 200) {
+          setTimeout(finalizeAttach, 10);
+          return;
+        }
+
+        session.attaching = false;
+
+        socket.write(encode({ type: "attached" }));
+
+        // Set terminal title
+        sendTitle(socket, sessionName, session.processTitle);
+      };
+
+      finalizeAttach();
+    };
+
+    sendState();
+  };
+
   // Create session socket
   Bun.listen({
     unix: socketPath,
@@ -506,97 +624,30 @@ function createSession(name: string | undefined, cwd: string): Session {
         }
 
         session.attaching = true;
+        session.attachPending = true;
         session.attachBuffer = [];
         session.client = socket;
         session.info.attached = true;
         session.lastAttached = Date.now(); // Record attach time for grace period
         session.ctrlBuffer = Buffer.alloc(0);
-
-        // Wait for any pending xterm writes to complete
-        const sendState = () => {
-          if (session.pendingWrites > 0) {
-            setTimeout(sendState, 10);
-            return;
-          }
-
-          try {
-            // Get serialized terminal state (including modes) for consistent redraws
-            const serialized = session.serialize.serialize();
-
-            // Send reset first to clear any bad modes, then restore content
-            socket.write(TERM_RESET);
-            socket.write(Buffer.from("\x1b[2J\x1b[H")); // clear + home
-            socket.write(Buffer.from(serialized));
-
-            console.log(`[${sessionName}] attached (restored ${serialized.length} chars)`);
-          } catch (e) {
-            console.log(`[${sessionName}] serialize error:`, e);
-            // Fallback: just send a reset
-            socket.write(TERM_RESET);
-            socket.write(Buffer.from("\x1b[2J\x1b[H"));
-          }
-
-          const drainAttachBuffer = () => {
-            const buffered = session.attachBuffer;
-            session.attachBuffer = [];
-            for (const chunk of buffered) {
-              session.pendingWrites++;
-              session.xterm.write(chunk, () => {
-                session.pendingWrites--;
-              });
-              socket.write(chunk);
-            }
-          };
-
-          const attachStart = Date.now();
-          const finalizeAttach = () => {
-            if (session.attachBuffer.length > 0) {
-              drainAttachBuffer();
-            }
-
-            if ((session.pendingWrites > 0 || session.attachBuffer.length > 0) &&
-                Date.now() - attachStart < 200) {
-              setTimeout(finalizeAttach, 10);
-              return;
-            }
-
-            const core = (session.xterm as any)._core;
-            const isCursorHidden = core?.coreService?.isCursorHidden;
-            if (typeof isCursorHidden === "boolean") {
-              socket.write(Buffer.from(isCursorHidden ? "\x1b[?25l" : "\x1b[?25h"));
-            }
-
-            const cursorStyle = session.xterm.options.cursorStyle;
-            const cursorBlink = session.xterm.options.cursorBlink;
-            let cursorStyleParam: number | null = null;
-            if (cursorStyle === "block") {
-              cursorStyleParam = cursorBlink ? 2 : 1;
-            } else if (cursorStyle === "underline") {
-              cursorStyleParam = cursorBlink ? 4 : 3;
-            } else if (cursorStyle === "bar") {
-              cursorStyleParam = cursorBlink ? 6 : 5;
-            }
-            if (cursorStyleParam !== null) {
-              socket.write(Buffer.from(`\x1b[${cursorStyleParam} q`));
-            }
-
-            session.attaching = false;
-
-            socket.write(encode({ type: "attached" }));
-
-            // Set terminal title
-            sendTitle(socket, sessionName, session.processTitle);
-          };
-
-          finalizeAttach();
-        };
-
-        sendState();
+        clearAttachTimer(session);
+        session.attachTimer = setTimeout(() => startAttach(session), 200);
       },
 
       data(socket, data) {
         const session = sessions.get(id);
         if (!session) return;
+
+        const applyResize = (cols: number, rows: number) => {
+          try {
+            session.ptyTerminal.resize(cols, rows);
+            session.xterm.resize(cols, rows);
+            // Send SIGWINCH to process group so children (vim, etc.) get it
+            process.kill(-proc.pid, "SIGWINCH");
+          } catch {
+            try { process.kill(proc.pid, "SIGWINCH"); } catch {}
+          }
+        };
 
         let buf = Buffer.from(data);
 
@@ -617,14 +668,10 @@ function createSession(name: string | undefined, cwd: string): Session {
             }
 
             const ctrl = decode(buf, offset) as SessionCtrl;
-            if (ctrl.type === "resize") {
-              try {
-                session.ptyTerminal.resize(ctrl.cols, ctrl.rows);
-                session.xterm.resize(ctrl.cols, ctrl.rows);
-                // Send SIGWINCH to process group so children (vim, etc.) get it
-                process.kill(-proc.pid, "SIGWINCH");
-              } catch {
-                try { process.kill(proc.pid, "SIGWINCH"); } catch {}
+            if (ctrl.type === "resize" || ctrl.type === "attach-init") {
+              applyResize(ctrl.cols, ctrl.rows);
+              if (session.attaching && session.attachPending) {
+                startAttach(session);
               }
             } else if (ctrl.type === "detach") {
               // Send reset before detaching to clean up client terminal
@@ -632,6 +679,8 @@ function createSession(name: string | undefined, cwd: string): Session {
               session.client = null;
               session.info.attached = false;
               session.attaching = false;
+              session.attachPending = false;
+              clearAttachTimer(session);
               session.attachBuffer = [];
               session.lastDetached = Date.now(); // Record detach time for grace period
               socket.end();
@@ -659,6 +708,8 @@ function createSession(name: string | undefined, cwd: string): Session {
           session.client = null;
           session.info.attached = false;
           session.attaching = false;
+          session.attachPending = false;
+          clearAttachTimer(session);
           session.attachBuffer = [];
           console.log(`[${sessionName}] disconnected`);
         }
@@ -677,6 +728,8 @@ function createSession(name: string | undefined, cwd: string): Session {
     pendingWrites: 0,
     attaching: false,
     attachBuffer: [],
+    attachPending: false,
+    attachTimer: null,
     processTitle: '',
     lastInteraction: 0,  // No interaction yet
     lastDetached: 0,  // Never detached yet

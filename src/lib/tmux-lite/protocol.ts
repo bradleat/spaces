@@ -2,7 +2,18 @@
  * tmux-lite protocol
  */
 
-export const ROUTER_SOCKET = "/tmp/tmux-lite.sock";
+const DEFAULT_ROUTER_SOCKET = "/tmp/tmux-lite.sock";
+const DEFAULT_SESSION_DIR = "/tmp";
+
+export function getRouterSocket(): string {
+  return process.env.TMUX_LITE_SOCKET || DEFAULT_ROUTER_SOCKET;
+}
+
+export function getSessionSocketPath(id: string): string {
+  const dir = process.env.TMUX_LITE_SESSION_DIR || DEFAULT_SESSION_DIR;
+  const normalizedDir = dir.endsWith("/") ? dir.slice(0, -1) : dir;
+  return `${normalizedDir}/tmux-lite-${id}.sock`;
+}
 
 // Router commands
 export type Command =
@@ -53,10 +64,12 @@ export interface InboxItem {
 export const CTRL_MAGIC = Buffer.from([0x1b, 0x5d, 0x39, 0x39]); // ESC ] 9 9
 
 export type SessionCtrl =
+  | { type: "attach-init"; cols: number; rows: number; clientType?: "cli" | "web" }
   | { type: "resize"; cols: number; rows: number }
   | { type: "detach" };
 
 export type SessionEvent =
+  | { type: "attach-ready"; cols: number; rows: number }
   | { type: "attached" }
   | { type: "exited"; code: number }
   | { type: "kicked" };

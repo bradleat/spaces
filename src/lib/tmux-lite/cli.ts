@@ -16,7 +16,7 @@ import { spawn } from "bun";
 import { existsSync } from "fs";
 import { select } from "@inquirer/prompts";
 import {
-  ROUTER_SOCKET,
+  getRouterSocket,
   type Command,
   type Response,
   type Session,
@@ -37,8 +37,19 @@ const TERM_RESET = "\x1bc";
 const SERVER_SCRIPT = `${import.meta.dir}/server.ts`;
 
 // CLI args
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const isTestMode = rawArgs.includes("--test");
+const args = rawArgs.filter(arg => arg !== "--test");
 const cmd = args[0] || "list";
+
+if (isTestMode) {
+  process.env.TMUX_LITE_SOCKET = "/tmp/tmux-lite-test.sock";
+  process.env.TMUX_LITE_SESSION_DIR = "/tmp/tmux-lite-test";
+}
+
+const getServerCommand = (): string[] => (
+  isTestMode ? ["bun", "run", SERVER_SCRIPT, "--test"] : ["bun", "run", SERVER_SCRIPT]
+);
 
 // Check if we're already inside a tmux-lite session
 export function isNested(): boolean {
@@ -56,7 +67,8 @@ function checkNested(): boolean {
 
 // Check if server is running
 export async function isServerRunning(): Promise<boolean> {
-  if (!existsSync(ROUTER_SOCKET)) return false;
+  const routerSocket = getRouterSocket();
+  if (!existsSync(routerSocket)) return false;
   try {
     await send({ type: "list" });
     return true;
@@ -70,7 +82,7 @@ export async function ensureServer(): Promise<void> {
   if (await isServerRunning()) return;
 
   spawn({
-    cmd: ["bun", "run", SERVER_SCRIPT],
+    cmd: getServerCommand(),
     stdout: "ignore",
     stderr: "ignore",
   });
@@ -86,8 +98,9 @@ export async function ensureServer(): Promise<void> {
 export async function send(cmd: Command): Promise<Response> {
   return new Promise(async (resolve, reject) => {
     try {
+      const routerSocket = getRouterSocket();
       const socket = await Bun.connect({
-        unix: ROUTER_SOCKET,
+        unix: routerSocket,
         socket: {
           data(socket, data) {
             resolve(JSON.parse(data.toString()));
@@ -166,6 +179,8 @@ function formatSession(s: Session): string {
 // Ctrl+Esc sequences (different terminals send different formats)
 const CTRL_ESC_CSI_U = Buffer.from([0x1b, 0x5b, 0x32, 0x37, 0x3b, 0x35, 0x75]); // ESC [ 27;5u
 const CTRL_ESC_XTERM = Buffer.from([0x1b, 0x5b, 0x32, 0x37, 0x3b, 0x35, 0x3b, 0x32, 0x37, 0x7e]); // ESC [ 27;5;27 ~
+const BRACKETED_PASTE_START = Buffer.from([0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e]); // ESC [ 200 ~
+const BRACKETED_PASTE_END = Buffer.from([0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]); // ESC [ 201 ~
 
 function containsCtrlEsc(buf: Buffer): number {
   const idx1 = buf.indexOf(CTRL_ESC_CSI_U);
@@ -195,7 +210,8 @@ export async function attach(session: Session, quiet: boolean = false): Promise<
 
   return new Promise(async (resolve) => {
     let buffer = Buffer.alloc(0);
-    let inputBuffer = Buffer.alloc(0);
+    let pendingSeq = Buffer.alloc(0);
+    let inBracketedPaste = false;
     let resolved = false;
     let stdinListener: ((chunk: Buffer) => void) | null = null;
     let socket: Awaited<ReturnType<typeof Bun.connect>> | null = null;
@@ -248,6 +264,12 @@ export async function attach(session: Session, quiet: boolean = false): Promise<
       }
       lastSize = { cols, rows };
       socket.write(encode({ type: "resize", cols, rows }));
+    };
+
+    const sendAttachInit = () => {
+      if (!socket) return;
+      const { cols, rows } = getTermSize();
+      socket.write(encode({ type: "attach-init", cols, rows, clientType: "cli" }));
     };
 
     const sendResizePulse = (delayMs: number) => {
@@ -328,6 +350,7 @@ export async function attach(session: Session, quiet: boolean = false): Promise<
     });
 
     // Initial resize
+    sendAttachInit();
     sendResize(true);
 
     onResize = () => {
@@ -339,35 +362,85 @@ export async function attach(session: Session, quiet: boolean = false): Promise<
 
     // Forward stdin with Ctrl+Esc detection
     stdinListener = (chunk: Buffer) => {
-      const combined = Buffer.concat([inputBuffer, chunk]);
+      const combined = pendingSeq.length > 0 ? Buffer.concat([pendingSeq, chunk]) : chunk;
+      pendingSeq = Buffer.alloc(0);
+      const out: Buffer[] = [];
+      let offset = 0;
 
-      // Look for Ctrl+Esc anywhere in the buffer
-      const ctrlEscIndex = containsCtrlEsc(combined);
-      if (ctrlEscIndex !== -1) {
-        // Send everything before Ctrl+Esc to the PTY
-        if (ctrlEscIndex > 0) {
-          socket.write(combined.subarray(0, ctrlEscIndex));
+      const flushOut = () => {
+        if (out.length > 0 && socket) {
+          socket.write(Buffer.concat(out));
+          out.length = 0;
         }
-        // Detach
-        socket.write(encode({ type: "detach" }));
-        cleanup({ type: "detached" });
-        return;
+      };
+
+      const getSequences = () => (
+        inBracketedPaste
+          ? [BRACKETED_PASTE_START, BRACKETED_PASTE_END]
+          : [BRACKETED_PASTE_START, BRACKETED_PASTE_END, CTRL_ESC_CSI_U, CTRL_ESC_XTERM]
+      );
+
+      while (offset < combined.length) {
+        if (combined[offset] !== 0x1b) {
+          const nextEsc = combined.indexOf(0x1b, offset + 1);
+          if (nextEsc === -1) {
+            out.push(combined.subarray(offset));
+            offset = combined.length;
+          } else {
+            out.push(combined.subarray(offset, nextEsc));
+            offset = nextEsc;
+          }
+          continue;
+        }
+
+        const sequences = getSequences();
+        let matched: Buffer | null = null;
+        for (const seq of sequences) {
+          if (combined.length - offset >= seq.length &&
+              combined.subarray(offset, offset + seq.length).equals(seq)) {
+            matched = seq;
+            break;
+          }
+        }
+
+        if (matched) {
+          if (matched === CTRL_ESC_CSI_U || matched === CTRL_ESC_XTERM) {
+            flushOut();
+            socket?.write(encode({ type: "detach" }));
+            cleanup({ type: "detached" });
+            return;
+          }
+
+          out.push(combined.subarray(offset, offset + matched.length));
+          if (matched === BRACKETED_PASTE_START) {
+            inBracketedPaste = true;
+          } else if (matched === BRACKETED_PASTE_END) {
+            inBracketedPaste = false;
+          }
+          offset += matched.length;
+          continue;
+        }
+
+        let possiblePrefix = false;
+        for (const seq of sequences) {
+          const remaining = combined.length - offset;
+          if (remaining < seq.length &&
+              seq.subarray(0, remaining).equals(combined.subarray(offset))) {
+            possiblePrefix = true;
+            break;
+          }
+        }
+
+        if (possiblePrefix) {
+          pendingSeq = combined.subarray(offset);
+          break;
+        }
+
+        out.push(combined.subarray(offset, offset + 1));
+        offset += 1;
       }
 
-      // Check if buffer ends with ESC (potential start of sequence)
-      if (combined[combined.length - 1] === 0x1b) {
-        // Hold back the ESC
-        socket.write(combined.subarray(0, -1));
-        inputBuffer = combined.subarray(-1);
-      } else if (combined.length > 1 && combined[combined.length - 2] === 0x1b) {
-        // Hold back ESC + one more byte
-        socket.write(combined.subarray(0, -2));
-        inputBuffer = combined.subarray(-2);
-      } else {
-        // Send everything
-        socket.write(combined);
-        inputBuffer = Buffer.alloc(0);
-      }
+      flushOut();
     };
 
     process.stdin.on("data", stdinListener);
@@ -395,7 +468,7 @@ async function main() {
     }
     console.log("Starting server...");
     spawn({
-      cmd: ["bun", "run", `${import.meta.dir}/server.ts`],
+      cmd: getServerCommand(),
       stdout: "inherit",
       stderr: "inherit",
     });

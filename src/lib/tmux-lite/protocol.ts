@@ -15,6 +15,41 @@ export function getSessionSocketPath(id: string): string {
   return `${normalizedDir}/tmux-lite-${id}.sock`;
 }
 
+const ROUTER_FRAME_HEADER_BYTES = 4;
+
+export function encodeRouterMessage(msg: Command | Response): Buffer {
+  const json = JSON.stringify(msg);
+  const len = Buffer.byteLength(json);
+  const buf = Buffer.alloc(ROUTER_FRAME_HEADER_BYTES + len);
+  buf.writeUInt32BE(len, 0);
+  buf.write(json, ROUTER_FRAME_HEADER_BYTES);
+  return buf;
+}
+
+export function decodeRouterMessages(buffer: Buffer): {
+  messages: Array<Command | Response>;
+  remaining: Buffer;
+} {
+  const messages: Array<Command | Response> = [];
+  let offset = 0;
+
+  while (offset + ROUTER_FRAME_HEADER_BYTES <= buffer.length) {
+    const len = buffer.readUInt32BE(offset);
+    const frameEnd = offset + ROUTER_FRAME_HEADER_BYTES + len;
+    if (frameEnd > buffer.length) {
+      break;
+    }
+    const json = buffer.subarray(offset + ROUTER_FRAME_HEADER_BYTES, frameEnd).toString();
+    messages.push(JSON.parse(json));
+    offset = frameEnd;
+  }
+
+  return {
+    messages,
+    remaining: buffer.subarray(offset),
+  };
+}
+
 // Router commands
 export type Command =
   | { type: "list" }

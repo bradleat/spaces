@@ -22,6 +22,8 @@ import {
   type Session,
   type SessionEvent,
   type InboxItem,
+  encodeRouterMessage,
+  decodeRouterMessages,
   encode,
   isCtrlMagic,
   decode,
@@ -97,22 +99,52 @@ export async function ensureServer(): Promise<void> {
 // Send command to server
 export async function send(cmd: Command): Promise<Response> {
   return new Promise(async (resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    let settled = false;
+    let socketRef: Awaited<ReturnType<typeof Bun.connect>> | null = null;
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      socketRef?.end();
+      reject(err);
+    };
+
     try {
       const routerSocket = getRouterSocket();
       const socket = await Bun.connect({
         unix: routerSocket,
         socket: {
           data(socket, data) {
-            resolve(JSON.parse(data.toString()));
-            socket.end();
+            if (settled) return;
+            buffer = Buffer.concat([buffer, Buffer.from(data)]);
+            let decoded;
+            try {
+              decoded = decodeRouterMessages(buffer);
+            } catch (err) {
+              fail(err instanceof Error ? err : new Error("Invalid response"));
+              return;
+            }
+            buffer = decoded.remaining;
+            if (decoded.messages.length > 0) {
+              settled = true;
+              resolve(decoded.messages[0] as Response);
+              socket.end();
+            }
           },
-          error(_, e) { reject(e); },
-          connectError(_, e) { reject(e); }
+          close() {
+            if (!settled) {
+              fail(new Error("Connection closed before response"));
+            }
+          },
+          error(_, e) { fail(e); },
+          connectError(_, e) { fail(e); }
         }
       });
-      socket.write(JSON.stringify(cmd));
+      socketRef = socket;
+      socket.write(encodeRouterMessage(cmd));
     } catch (e) {
-      reject(e);
+      fail(e instanceof Error ? e : new Error(String(e)));
     }
   });
 }

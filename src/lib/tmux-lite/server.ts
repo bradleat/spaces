@@ -17,6 +17,8 @@ import {
   type Session,
   type SessionCtrl,
   type InboxItem,
+  encodeRouterMessage,
+  decodeRouterMessages,
   encode,
   isCtrlMagic,
   decode,
@@ -745,90 +747,110 @@ Bun.listen({
   unix: ROUTER_SOCKET,
   socket: {
     data(socket, data) {
-      const cmd: Command = JSON.parse(data.toString());
-      let res: Response;
+      const existing = (socket as any)._routerBuffer || Buffer.alloc(0);
+      const combined = Buffer.concat([existing, Buffer.from(data)]);
+      let decoded;
 
-      // Helper to get session info with current processTitle
-      const getSessionInfo = (s: SessionData): Session => ({
-        ...s.info,
-        processTitle: s.processTitle || undefined,
-      });
-
-      switch (cmd.type) {
-        case "list":
-          res = {
-            type: "sessions",
-            sessions: Array.from(sessions.values()).map(getSessionInfo)
-          };
-          break;
-
-        case "new":
-          const session = createSession(cmd.name, cmd.cwd);
-          res = { type: "session", session };
-          break;
-
-        case "attach": {
-          const s = sessions.get(cmd.id);
-          if (!s) {
-            res = { type: "error", message: `Session ${cmd.id} not found` };
-          } else if (s.info.attached && !cmd.force) {
-            res = { type: "already-attached", session: getSessionInfo(s) };
-          } else {
-            res = { type: "session", session: getSessionInfo(s) };
-          }
-          break;
-        }
-
-        case "kill": {
-          const s = sessions.get(cmd.id);
-          if (!s) {
-            res = { type: "error", message: `Session ${cmd.id} not found` };
-          } else {
-            s.proc.kill();
-            res = { type: "ok" };
-          }
-          break;
-        }
-
-        case "kill-server":
-          console.log("Shutting down...");
-          for (const [id, s] of sessions) {
-            s.xterm.dispose();
-            s.proc.kill();
-          }
-          res = { type: "ok" };
-          socket.write(JSON.stringify(res));
-          setTimeout(() => process.exit(0), 100);
-          return;
-
-        case "inbox":
-          res = { type: "inbox", items: [...inbox] };
-          break;
-
-        case "inbox-clear":
-          if (cmd.id) {
-            const idx = inbox.findIndex(i => i.id === cmd.id);
-            if (idx !== -1) inbox.splice(idx, 1);
-          } else {
-            inbox.length = 0;
-          }
-          broadcastTitleUpdate();
-          res = { type: "ok" };
-          break;
-
-        case "inbox-read": {
-          const item = inbox.find(i => i.id === cmd.id);
-          if (item) item.read = true;
-          broadcastTitleUpdate();
-          res = { type: "ok" };
-          break;
-        }
-
-        default:
-          res = { type: "error", message: "Unknown command" };
+      try {
+        decoded = decodeRouterMessages(combined);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Invalid request";
+        socket.write(encodeRouterMessage({ type: "error", message }));
+        (socket as any)._routerBuffer = Buffer.alloc(0);
+        return;
       }
 
-      socket.write(JSON.stringify(res));
+      (socket as any)._routerBuffer = decoded.remaining;
+
+      for (const message of decoded.messages) {
+        const cmd = message as Command;
+        let res: Response;
+
+        // Helper to get session info with current processTitle
+        const getSessionInfo = (s: SessionData): Session => ({
+          ...s.info,
+          processTitle: s.processTitle || undefined,
+        });
+
+        switch (cmd.type) {
+          case "list":
+            res = {
+              type: "sessions",
+              sessions: Array.from(sessions.values()).map(getSessionInfo)
+            };
+            break;
+
+          case "new":
+            const session = createSession(cmd.name, cmd.cwd);
+            res = { type: "session", session };
+            break;
+
+          case "attach": {
+            const s = sessions.get(cmd.id);
+            if (!s) {
+              res = { type: "error", message: `Session ${cmd.id} not found` };
+            } else if (s.info.attached && !cmd.force) {
+              res = { type: "already-attached", session: getSessionInfo(s) };
+            } else {
+              res = { type: "session", session: getSessionInfo(s) };
+            }
+            break;
+          }
+
+          case "kill": {
+            const s = sessions.get(cmd.id);
+            if (!s) {
+              res = { type: "error", message: `Session ${cmd.id} not found` };
+            } else {
+              s.proc.kill();
+              res = { type: "ok" };
+            }
+            break;
+          }
+
+          case "kill-server":
+            console.log("Shutting down...");
+            for (const [id, s] of sessions) {
+              s.xterm.dispose();
+              s.proc.kill();
+            }
+            res = { type: "ok" };
+            socket.write(encodeRouterMessage(res));
+            setTimeout(() => process.exit(0), 100);
+            return;
+
+          case "inbox":
+            res = { type: "inbox", items: [...inbox] };
+            break;
+
+          case "inbox-clear":
+            if (cmd.id) {
+              const idx = inbox.findIndex(i => i.id === cmd.id);
+              if (idx !== -1) inbox.splice(idx, 1);
+            } else {
+              inbox.length = 0;
+            }
+            broadcastTitleUpdate();
+            res = { type: "ok" };
+            break;
+
+          case "inbox-read": {
+            const item = inbox.find(i => i.id === cmd.id);
+            if (item) item.read = true;
+            broadcastTitleUpdate();
+            res = { type: "ok" };
+            break;
+          }
+
+          default:
+            res = { type: "error", message: "Unknown command" };
+        }
+
+        socket.write(encodeRouterMessage(res));
+      }
+    },
+    close(socket) {
+      (socket as any)._routerBuffer = Buffer.alloc(0);
     }
   }
 });

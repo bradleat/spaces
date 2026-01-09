@@ -1,3 +1,25 @@
+# This repository has moved
+
+**GitSpace has been renamed and moved to a new home:**
+
+## https://github.com/inKibra/gitspace.sh
+
+Please use the new repository for:
+- Installation
+- Issues and bug reports
+- Pull requests and contributions
+- Documentation
+
+```bash
+# Install from the new repo
+npm install -g gitspace
+```
+
+---
+
+<details>
+<summary>Original README (archived)</summary>
+
 # Spaces CLI
 
 A powerful CLI tool for managing GitHub repository workspaces using git worktrees and optional Linear integration. Work on multiple features/tasks simultaneously, each in its own isolated workspace. Features an interactive TUI and support for repo config bundles for team onboarding.
@@ -448,3 +470,5 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+</details>
